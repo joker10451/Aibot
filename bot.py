@@ -24,7 +24,7 @@ ADMIN_ID             = int(os.getenv("ADMIN_ID", 0))  # твой Telegram user_i
 STARS_PRICE          = int(os.getenv("STARS_PRICE", 100))  # цена в Stars
 FREE_LIMIT           = int(os.getenv("FREE_LIMIT", 5))
 MAX_HISTORY          = int(os.getenv("MAX_HISTORY", 20))
-MAX_TOKENS           = int(os.getenv("MAX_TOKENS", 1024))
+MAX_TOKENS           = int(os.getenv("MAX_TOKENS", 800))  # Снижено для экономии
 TEMPERATURE          = float(os.getenv("TEMPERATURE", 0.7))
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS", "firebase.json")
 
@@ -85,6 +85,7 @@ MODES = {
 }
 
 user_modes = {}  # {user_id: system_prompt}
+user_last_request = {}  # {user_id: timestamp} — защита от спама
 
 SYSTEM_PROMPT = {
     "role": "system",
@@ -350,6 +351,16 @@ def get_main_menu() -> ReplyKeyboardMarkup:
     return kb
 
 
+def get_quick_start_menu() -> ReplyKeyboardMarkup:
+    """Быстрый старт с готовыми сценариями."""
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
+        [KeyboardButton(text="✍️ Написать текст"), KeyboardButton(text="📚 Сделать домашку")],
+        [KeyboardButton(text="💸 Идея заработка"), KeyboardButton(text="🎬 Сценарий TikTok")],
+        [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🧹 Очистить")],
+    ])
+    return kb
+
+
 # ─── Бот и диспетчер ─────────────────────────────────────────────────────────
 bot = Bot(token=TELEGRAM_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
@@ -382,13 +393,8 @@ async def cmd_start(message: Message) -> None:
         "📚 решить домашку и объяснить\n"
         "💸 дать идею заработка с планом\n"
         "🎬 придумать сценарий для TikTok\n\n"
-        "👇 Попробуй прямо сейчас:\n"
-        "— \"напиши сочинение про экологию\"\n"
-        "— \"идея заработка с 0€\"\n"
-        "— \"сценарий для TikTok\"\n\n"
-        "━━━━━━━━━━━━━━━\n"
-        f"{access_line}",
-        reply_markup=get_main_menu(),
+        "👇 Выбери, что нужно сделать:",
+        reply_markup=get_quick_start_menu(),
     )
 
 
@@ -517,12 +523,26 @@ async def successful_payment(message: Message) -> None:
     limit = TIERS[tier]["limit"]
     limit_text = "безлимит" if limit == -1 else f"{limit} сообщений/месяц"
 
-    await message.answer(
+    success_message = (
         f"🎉 Оплата {stars} ⭐ прошла успешно!\n\n"
         f"✅ Тариф {tier_name} активирован.\n"
         f"📊 Лимит: {limit_text}\n"
         "Пиши — я отвечу 🚀"
     )
+    
+    # Upsell для Basic → Pro
+    if tier == "basic":
+        success_message += (
+            "\n\n━━━━━━━━━━━━━━━\n"
+            "🔥 Хочешь ещё мощнее?\n\n"
+            "Pro доступ (200 ⭐):\n"
+            "— безлимитные ответы\n"
+            "— доступ ко всем 7 моделям\n"
+            "— быстрее обработка\n\n"
+            "Апгрейд всего за +100 ⭐"
+        )
+    
+    await message.answer(success_message)
 
     # Уведомление админу
     if ADMIN_ID:
@@ -545,6 +565,46 @@ async def buy_access(message: Message) -> None:
 
 
 # ─── Обработчики кнопок меню ─────────────────────────────────────────────────
+
+@dp.message(F.text == "✍️ Написать текст")
+async def quick_write_text(message: Message) -> None:
+    """Быстрый старт: написать текст."""
+    user_modes[message.from_user.id] = MODES["✍️ Тексты"]
+    await message.answer(
+        "✍️ Напиши тему — я создам текст\n\nНапример:\n— \"пост про путешествия\"\n— \"сочинение про экологию\"",
+        reply_markup=get_main_menu(),
+    )
+
+
+@dp.message(F.text == "📚 Сделать домашку")
+async def quick_homework(message: Message) -> None:
+    """Быстрый старт: домашка."""
+    user_modes[message.from_user.id] = MODES["📚 Домашка"]
+    await message.answer(
+        "📚 Напиши задачу — я решу и объясню\n\nНапример:\n— \"реши уравнение x² + 5x + 6 = 0\"\n— \"объясни фотосинтез\"",
+        reply_markup=get_main_menu(),
+    )
+
+
+@dp.message(F.text == "💸 Идея заработка")
+async def quick_money(message: Message) -> None:
+    """Быстрый старт: заработок."""
+    user_modes[message.from_user.id] = MODES["💸 Заработок"]
+    await message.answer(
+        "💸 Напиши, сколько хочешь зарабатывать — я дам план\n\nНапример:\n— \"идея заработка с 0€\"\n— \"как заработать 500€/месяц\"",
+        reply_markup=get_main_menu(),
+    )
+
+
+@dp.message(F.text == "🎬 Сценарий TikTok")
+async def quick_tiktok(message: Message) -> None:
+    """Быстрый старт: TikTok."""
+    user_modes[message.from_user.id] = MODES["🎬 TikTok идеи"]
+    await message.answer(
+        "🎬 Напиши тему — я создам вирусный сценарий\n\nНапример:\n— \"сценарий про животных\"\n— \"идея для танца\"",
+        reply_markup=get_main_menu(),
+    )
+
 
 @dp.message(F.text.in_(list(MODES.keys())))
 async def set_mode(message: Message) -> None:
@@ -705,6 +765,15 @@ async def handle_message(message: Message) -> None:
         await message.answer("🚫 Ваш аккаунт заблокирован.")
         return
 
+    # Защита от спама (макс 1 запрос в 3 секунды)
+    import time
+    current_time = time.time()
+    last_request = user_last_request.get(user_id, 0)
+    if current_time - last_request < 3:
+        await message.answer("⏳ Подожди немного, я ещё обрабатываю предыдущий запрос...")
+        return
+    user_last_request[user_id] = current_time
+
     if not has_access_from(user_data):
         tier = user_data.get("tier", "free")
         limit = TIERS[tier]["limit"]
@@ -754,7 +823,10 @@ async def handle_message(message: Message) -> None:
             await message.answer(part)
     except Exception as e:
         logger.error(f"Ошибка NVIDIA API: {e}")
-        await message.answer("⚠️ Ошибка AI. Попробуй ещё раз.")
+        await message.answer(
+            "⚠️ Сервер загружен, попробуй ещё раз через пару секунд\n\n"
+            "Если проблема повторяется — напиши /help"
+        )
 
 
 @dp.message()
