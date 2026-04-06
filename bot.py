@@ -5,6 +5,7 @@ import logging
 import os
 import tempfile
 from collections import defaultdict
+import re
 from openai import OpenAI
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -140,7 +141,9 @@ HOMEWORK_BASE_PROMPT = (
     "Качество:\n"
     "— Если не уверен, прямо скажи, что нужна проверка\n"
     "— Для математики всегда показывай промежуточные шаги\n"
-    "— Избегай длинной воды, пиши кратко и по делу\n\n"
+    "— Избегай длинной воды, пиши кратко и по делу\n"
+    "— Одна мысль = один короткий абзац (1–3 строки)\n"
+    "— Если ответ длинный, в конце добавь короткое резюме (3–5 пунктов)\n\n"
     "Формат ответа (если уместно):\n"
     "✅ Ответ: ...\n"
     "🧩 Решение по шагам:\n"
@@ -442,7 +445,57 @@ def format_answer(text: str) -> str:
     
     # Финальная подчистка одиночных звездочек внутри текста
     text = text.replace("*", "")
-    return text.strip()
+
+    # Нормализуем переносы и визуальные блоки, чтобы не было "полотна"
+    # 1) убираем лишние пробелы и >2 пустых строк подряд
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    # 2) Добавляем пустую строку перед "заголовками" с эмодзи
+    #    и разрезаем случаи, когда модель склеила заголовки в одну строку
+    heading_emojis = "✅🧩🧠🔎📝📌📆📊🚀❓💡🎯"
+    text = re.sub(rf"(?<!\n)\s*([{heading_emojis}])\s*", r"\n\n\1 ", text)
+
+    lines = text.splitlines()
+    pretty = []
+    for i, line in enumerate(lines):
+        s = line.strip()
+        is_heading = bool(re.match(r"^[✅🧩🧠🔎📝📌📆📊🚀❓💡🎯] ", s)) or bool(re.match(r"^[✅🧩🧠🔎📝📌📆📊🚀❓💡🎯]", s))
+        if is_heading and pretty and pretty[-1].strip() != "":
+            pretty.append("")
+        pretty.append(line.rstrip())
+    text = "\n".join(pretty)
+
+    # 3) Чуть улучшаем читабельность списков
+    #    - "1." и "1)" -> "1)"; лишние пробелы после маркеров
+    text = re.sub(r"^(\s*\d+)\.\s+", r"\1) ", text, flags=re.MULTILINE)
+    text = re.sub(r"^(\s*•)\s+", "• ", text, flags=re.MULTILINE)
+
+    # 4) Если текст всё равно выглядит монолитом, добавим мягкую разбивку после предложений в больших абзацах
+    #    (только если в строке > 220 символов и нет явных переносов)
+    wrapped_lines = []
+    for line in text.splitlines():
+        if len(line) > 220 and "•" not in line and not re.search(r"\d\)", line):
+            # попробуем вставить перенос после ближайшей точки/двоеточия
+            parts = re.split(r"(?<=[\.:;])\s+", line)
+            buf = ""
+            for part in parts:
+                if not buf:
+                    buf = part
+                elif len(buf) + 1 + len(part) <= 160:
+                    buf += " " + part
+                else:
+                    wrapped_lines.append(buf)
+                    buf = part
+            if buf:
+                wrapped_lines.append(buf)
+        else:
+            wrapped_lines.append(line)
+    text = "\n".join(wrapped_lines)
+
+    # финальная нормализация
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
 
 
 def split_text(text: str, max_length: int = 4000) -> list[str]:
