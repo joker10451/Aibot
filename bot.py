@@ -639,7 +639,16 @@ async def ask_nvidia(user_id: int, user_text: str, append_user_message: bool = T
 
 def buy_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"⭐ Открыть безлимит ({STARS_PRICE} Stars)", callback_data="buy")],
+        [
+            InlineKeyboardButton(
+                text=f"⭐ Basic ({TIERS['basic']['price']} Stars)",
+                callback_data="buy:basic",
+            ),
+            InlineKeyboardButton(
+                text=f"🚀 Pro ({TIERS['pro']['price']} Stars)",
+                callback_data="buy:pro",
+            ),
+        ],
     ])
 
 
@@ -812,18 +821,29 @@ async def callback_model(call: CallbackQuery) -> None:
     await call.answer()
 
 
-@dp.callback_query(F.data == "buy")
+@dp.callback_query(F.data.startswith("buy"))
 async def callback_buy(call: CallbackQuery) -> None:
     """Отправляем инвойс Telegram Stars при нажатии кнопки."""
-    await log_event(call.from_user.id, "invoice_sent", {"price": STARS_PRICE})
+    parts = (call.data or "").split(":", 1)
+    tier = parts[1] if len(parts) == 2 else "basic"
+    if tier not in ("basic", "pro"):
+        tier = "basic"
+
+    price = int(TIERS[tier]["price"])
+    tier_name = TIERS[tier]["name"]
+
+    await log_event(call.from_user.id, "invoice_sent", {"price": price, "tier": tier})
     await bot.send_invoice(
         chat_id=call.from_user.id,
         title="Доступ к AskNeuro AI",
-        description=f"Безлимитный доступ к нейросети — {STARS_PRICE} ⭐",
-        payload="ai_access_stars",
+        description=(
+            f"Тариф {tier_name} — {price} ⭐\n"
+            f"{'Безлимит + все модели' if tier == 'pro' else '100 сообщений/30 дней'}"
+        ),
+        payload=f"ai_access_stars:{tier}",
         provider_token="",        # пусто — это Telegram Stars (XTR)
         currency="XTR",
-        prices=[LabeledPrice(label="Безлимитный доступ", amount=STARS_PRICE)],
+        prices=[LabeledPrice(label=f"{tier_name} доступ", amount=price)],
     )
     await call.answer()
 
