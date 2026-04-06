@@ -27,7 +27,9 @@ load_dotenv()
 
 TELEGRAM_TOKEN       = os.getenv("TELEGRAM_TOKEN")
 NVIDIA_API_KEY       = os.getenv("NVIDIA_API_KEY")
-NVIDIA_MODEL         = os.getenv("NVIDIA_MODEL", "meta/llama-3.1-70b-instruct")
+NVIDIA_MODEL         = os.getenv("NVIDIA_MODEL", "mistralai/mistral-7b-instruct-v0.3")
+# Принудительно используем рабочую модель для стабильности
+NVIDIA_MODEL = "z-ai/glm4_7"
 ADMIN_USERNAME       = os.getenv("ADMIN_USERNAME", "@your_username")
 ADMIN_ID             = int(os.getenv("ADMIN_ID", 0))  # твой Telegram user_id
 STARS_PRICE          = int(os.getenv("STARS_PRICE", 100))  # цена в Stars
@@ -201,6 +203,8 @@ PAYWALL_VARIANTS = {
         f"🚀 Тарифы:\n"
         f"• Basic — {TIERS['basic']['price']} ⭐: 100 сообщений/30 дней\n"
         f"• Pro — {TIERS['pro']['price']} ⭐: безлимит + все модели\n\n"
+        "💡 Нужны Stars? Быстрая покупка:\n"
+        "👉 https://t.me/onelinkgo_bot?start=_tgr_KBB2ywM0Mjky\n\n"
         "Нажми кнопку и продолжай 👇"
     ),
     "B": (
@@ -212,6 +216,8 @@ PAYWALL_VARIANTS = {
         f"Выбери тариф:\n"
         f"• Basic ({TIERS['basic']['price']} ⭐) — 100 сообщений/30 дней\n"
         f"• Pro ({TIERS['pro']['price']} ⭐) — безлимит + все модели\n\n"
+        "⭐ Нет Stars? Купи через партнера:\n"
+        "👉 https://t.me/onelinkgo_bot?start=_tgr_KBB2ywM0Mjky\n\n"
         "Открой доступ 👇"
     ),
 }
@@ -223,6 +229,8 @@ BUY_SCREEN_VARIANTS = {
         "— больше сообщений без пауз\n"
         "— доступ к более мощным моделям\n"
         "— быстрые ответы для учёбы\n\n"
+        "💡 Нужны Stars? Быстрая покупка через бота:\n"
+        "👉 https://t.me/onelinkgo_bot?start=_tgr_KBB2ywM0Mjky\n\n"
         "Нажми кнопку ниже:"
     ),
     "B": (
@@ -231,6 +239,8 @@ BUY_SCREEN_VARIANTS = {
         "— решения по шагам\n"
         "— проверка ответов\n"
         "— короткие конспекты\n\n"
+        "⭐ Нет Stars? Купи через нашего партнера:\n"
+        "👉 https://t.me/onelinkgo_bot?start=_tgr_KBB2ywM0Mjky\n\n"
         "Жми кнопку ниже:"
     ),
 }
@@ -464,16 +474,28 @@ async def ocr_space_image(image_bytes: bytes, language: str = "rus") -> tuple[st
     data.add_field("isOverlayRequired", "true")
     data.add_field("file", image_bytes, filename="image.jpg", content_type="image/jpeg")
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15, connect=10)) as session:
         async with session.post(url, data=data) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"OCR API HTTP {resp.status}")
             payload = await resp.json(content_type=None)
 
+    # Логируем ответ для диагностики
     if isinstance(payload, dict) and payload.get("IsErroredOnProcessing"):
         msg = payload.get("ErrorMessage") or payload.get("ErrorDetails") or "OCR error"
+        logger.warning(f"OCR error: {msg}")
         raise RuntimeError(str(msg))
 
-    parsed = (payload.get("ParsedResults") or []) if isinstance(payload, dict) else []
+    # Проверяем структуру ответа
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid OCR response: {type(payload)}")
+
+    parsed = payload.get("ParsedResults") or []
     if not parsed:
+        # Проверяем есть ли ошибка в OCRExitCode
+        exit_code = payload.get("OCRExitCode")
+        if exit_code != 1:
+            logger.warning(f"OCR exit code: {exit_code}, response: {str(payload)[:200]}")
         return "", None
 
     text = "\n".join((p.get("ParsedText") or "") for p in parsed).strip()
@@ -665,15 +687,12 @@ def pick_model_for_request(user_data: dict, user_text: str) -> str:
     preferred = []
     if is_math or is_code or long:
         preferred = [
-            "meta/llama-3.3-70b-instruct",
-            "meta/llama-3.1-70b-instruct",
-            "nvidia/llama-3.1-nemotron-70b-instruct",
+            "z-ai/glm4_7",
+            "minimaxai/minimax-m2_1",
         ]
     else:
         preferred = [
             "z-ai/glm4_7",
-            "mistralai/mistral-7b-instruct-v0.3",
-            "meta/llama-3.1-70b-instruct",
         ]
 
     for mid in preferred:
@@ -1003,7 +1022,9 @@ async def cmd_status(message: Message) -> None:
             status_text += (
                 "\n\n🚀 Лимит исчерпан.\n"
                 f"Открой Basic за {TIERS['basic']['price']} ⭐ (100 сообщений/30 дней) "
-                f"или Pro за {TIERS['pro']['price']} ⭐ (безлимит)."
+                f"или Pro за {TIERS['pro']['price']} ⭐ (безлимит).\n\n"
+                "💡 Нужны Stars? Быстрая покупка:\n"
+                "👉 https://t.me/onelinkgo_bot?start=_tgr_KBB2ywM0Mjky"
             )
         
         await message.answer(
@@ -1730,7 +1751,9 @@ async def handle_message(message: Message) -> None:
             await log_event(user_id, "free_limit_warning", {"tier": tier, "left": 1})
             await message.answer(
                 f"⚠️ Остался 1 бесплатный запрос.\n\n"
-                f"Дальше: Basic {TIERS['basic']['price']} ⭐ или Pro {TIERS['pro']['price']} ⭐."
+                f"Дальше: Basic {TIERS['basic']['price']} ⭐ или Pro {TIERS['pro']['price']} ⭐.\n\n"
+                "💡 Нужны Stars? Быстрая покупка:\n"
+                "👉 https://t.me/onelinkgo_bot?start=_tgr_KBB2ywM0Mjky"
             )
     else:
         last_free_used = False
@@ -1870,6 +1893,10 @@ async def handle_photo(message: Message) -> None:
     await message.answer("🔎 Распознаю текст с фото…")
     try:
         text, conf = await ocr_space_image(image_bytes, language="rus")
+    except asyncio.TimeoutError:
+        await log_event(user_id, "ocr_error", {"error": "timeout"})
+        await message.answer("⚠️ Распознавание заняло слишком много времени. Попробуй ещё раз или пришли текстом.")
+        return
     except Exception as e:
         await log_event(user_id, "ocr_error", {"error": str(e)[:300]})
         await message.answer("⚠️ Не получилось распознать текст. Попробуй другое фото или пришли текстом.")
