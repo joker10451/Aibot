@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import tempfile
+from collections import defaultdict
 from openai import OpenAI
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -136,6 +137,10 @@ HOMEWORK_BASE_PROMPT = (
     "— Используй эмодзи для структуры и короткие абзацы\n"
     "— Если данных не хватает — задай 1–3 уточняющих вопроса\n"
     "— Не выдумывай факты, формулы и условия\n\n"
+    "Качество:\n"
+    "— Если не уверен, прямо скажи, что нужна проверка\n"
+    "— Для математики всегда показывай промежуточные шаги\n"
+    "— Избегай длинной воды, пиши кратко и по делу\n\n"
     "Формат ответа (если уместно):\n"
     "✅ Ответ: ...\n"
     "🧩 Решение по шагам:\n"
@@ -161,6 +166,24 @@ HOMEWORK_ACTIONS: dict[str, str] = {
 user_modes = {}  # {user_id: system_prompt}
 user_last_request = {}  # {user_id: timestamp} — защита от спама
 user_pending_homework_action = {}  # {user_id: action_instruction}
+user_last_prompt = {}  # {user_id: last_user_text} для /regen
+
+PAYWALL_VARIANTS = {
+    "A": (
+        "🔒 Лимит бесплатных сообщений закончился.\n\n"
+        f"🚀 Продолжай без остановки:\n"
+        f"• Basic — {TIERS['basic']['price']} ⭐: 100 сообщений/30 дней\n"
+        f"• Pro — {TIERS['pro']['price']} ⭐: безлимит + все модели\n\n"
+        "Нажми кнопку и продолжай прямо сейчас 👇"
+    ),
+    "B": (
+        "⛔ Бесплатный лимит исчерпан.\n\n"
+        "Что дальше:\n"
+        f"• Basic ({TIERS['basic']['price']} ⭐) — хватит на ежедневную учёбу\n"
+        f"• Pro ({TIERS['pro']['price']} ⭐) — безлимит и максимум скорости\n\n"
+        "Открой доступ за 1 минуту 👇"
+    ),
+}
 
 SYSTEM_PROMPT = {
     "role": "system",
@@ -469,10 +492,16 @@ async def check_and_reset_limits(user_id: int, user_data: dict) -> dict:
     return user_data
 
 
-async def ask_nvidia(user_id: int, user_text: str) -> str:
+def pick_paywall_variant(user_id: int) -> str:
+    """Стабильно выбирает вариант paywall для пользователя (A/B)."""
+    return "A" if (user_id % 2 == 0) else "B"
+
+
+async def ask_nvidia(user_id: int, user_text: str, append_user_message: bool = True) -> str:
     """Запрос к NVIDIA NIM API с историей из Firestore."""
-    # Сохраняем сообщение пользователя
-    await append_history(user_id, "user", user_text)
+    # Сохраняем сообщение пользователя (для обычных запросов)
+    if append_user_message:
+        await append_history(user_id, "user", user_text)
 
     # Загружаем историю для контекста
     history = await get_history(user_id)
@@ -502,15 +531,27 @@ async def ask_nvidia(user_id: int, user_text: str) -> str:
         system_prompt = {"role": "system", "content": base_prompt}
 
     loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: nvidia_client.chat.completions.create(
-            model=model,
-            messages=[system_prompt] + history,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-        ),
-    )
+    # Мягкий retry на временные сбои API
+    last_error = None
+    response = None
+    for attempt in range(2):
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda: nvidia_client.chat.completions.create(
+                    model=model,
+                    messages=[system_prompt] + history,
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                ),
+            )
+            break
+        except Exception as e:
+            last_error = e
+            if attempt == 0:
+                await asyncio.sleep(1.2)
+            else:
+                raise last_error
 
     answer = response.choices[0].message.content.strip()
     await append_history(user_id, "assistant", answer)
@@ -539,6 +580,7 @@ def get_main_menu() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📚 Домашка"), KeyboardButton(text="✍️ Тексты")],
         [KeyboardButton(text="🧩 Решение пошагово"), KeyboardButton(text="🧠 Объясни проще")],
         [KeyboardButton(text="🔎 Проверь ответ"), KeyboardButton(text="📝 Краткий конспект")],
+        [KeyboardButton(text="🔄 Перегенерировать")],
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🧹 Очистить")],
     ])
     return kb
@@ -788,6 +830,44 @@ async def buy_access(message: Message) -> None:
     )
 
 
+@dp.message(Command("regen"))
+async def cmd_regen(message: Message) -> None:
+    """/regen — перегенерировать последний ответ."""
+    user_id = message.from_user.id
+    last_prompt = user_last_prompt.get(user_id)
+    if not last_prompt:
+        await message.answer("Сначала отправь запрос, потом можно сделать перегенерацию.")
+        return
+    await handle_regen(message, user_id, last_prompt)
+
+
+@dp.message(F.text == "🔄 Перегенерировать")
+async def menu_regen(message: Message) -> None:
+    """Кнопка перегенерации последнего ответа."""
+    user_id = message.from_user.id
+    last_prompt = user_last_prompt.get(user_id)
+    if not last_prompt:
+        await message.answer("Сначала отправь любой запрос.")
+        return
+    await handle_regen(message, user_id, last_prompt)
+
+
+async def handle_regen(message: Message, user_id: int, last_prompt: str) -> None:
+    """Общая логика перегенерации ответа."""
+    await bot.send_chat_action(message.chat.id, "typing")
+    regen_prompt = (
+        f"Сделай альтернативный вариант ответа на этот запрос.\n\nЗапрос пользователя:\n{last_prompt}"
+    )
+    try:
+        answer = await ask_nvidia(user_id, regen_prompt, append_user_message=False)
+        answer = format_answer(answer)
+        await message.answer(answer)
+    except Exception as e:
+        logger.error(f"Ошибка regenerate: {e}")
+        await log_event(user_id, "error_nvidia", {"error": str(e)[:300], "source": "regen"})
+        await message.answer("Не удалось перегенерировать сейчас. Попробуй ещё раз через пару секунд.")
+
+
 # ─── Обработчики кнопок меню ─────────────────────────────────────────────────
 
 @dp.message(F.text == "✍️ Написать текст")
@@ -984,6 +1064,17 @@ async def cmd_funnel(message: Message) -> None:
     paywall = counts["paywall_shown"]
     invoice = counts["invoice_sent"]
     paid = counts["payment_success"]
+    unique_users = set()
+    paywall_variants = defaultdict(int)
+    for ev in events:
+        uid = ev.get("user_id")
+        if uid is not None:
+            unique_users.add(uid)
+        if ev.get("event") == "paywall_shown":
+            meta = ev.get("meta") or {}
+            variant = meta.get("variant")
+            if variant in {"A", "B"}:
+                paywall_variants[variant] += 1
 
     def pct(num: int, den: int) -> str:
         if den <= 0:
@@ -992,15 +1083,70 @@ async def cmd_funnel(message: Message) -> None:
 
     text = (
         f"Воронка за {days} дн.\n\n"
+        f"Уникальных пользователей: {len(unique_users)}\n"
         f"start: {start}\n"
         f"first_message: {first} (от start: {pct(first, start)})\n"
         f"paywall_shown: {paywall} (от first: {pct(paywall, first)})\n"
+        f"paywall A/B: A={paywall_variants['A']} | B={paywall_variants['B']}\n"
         f"invoice_sent: {invoice} (от paywall: {pct(invoice, paywall)})\n"
         f"payment_success: {paid} (от invoice: {pct(paid, invoice)})\n\n"
         f"Итог start→payment: {pct(paid, start)}\n"
         "Примечание: считаются события из `events` (ограничение выборки 5000 записей)."
     )
     await message.answer(text)
+
+
+@dp.message(Command("revenue"))
+async def cmd_revenue(message: Message) -> None:
+    """/revenue [days] — агрегат по оплатам и Stars."""
+    if message.from_user.id != ADMIN_ID:
+        return
+    args = message.text.split()
+    days = 7
+    if len(args) >= 2:
+        try:
+            days = int(args[1])
+        except ValueError:
+            days = 7
+    days = max(1, min(days, 90))
+
+    import datetime
+    since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+    loop = asyncio.get_event_loop()
+
+    def _load_payment_events() -> list[dict]:
+        docs = (
+            db.collection("events")
+            .where("event", "==", "payment_success")
+            .where("ts", ">=", since)
+            .order_by("ts", direction=firestore.Query.DESCENDING)
+            .limit(5000)
+            .get()
+        )
+        return [d.to_dict() for d in docs]
+
+    try:
+        payments = await loop.run_in_executor(None, _load_payment_events)
+    except Exception as e:
+        await message.answer(f"Ошибка чтения оплат: {e}")
+        return
+
+    total_stars = 0
+    total_payments = len(payments)
+    by_tier = defaultdict(int)
+    for ev in payments:
+        meta = ev.get("meta") or {}
+        stars = int(meta.get("stars", 0) or 0)
+        tier = str(meta.get("tier", "unknown"))
+        total_stars += stars
+        by_tier[tier] += 1
+
+    await message.answer(
+        f"Выручка за {days} дн.\n\n"
+        f"Оплат: {total_payments}\n"
+        f"Stars: {total_stars} ⭐\n"
+        f"По тарифам: basic={by_tier['basic']}, pro={by_tier['pro']}, other={by_tier['unknown']}"
+    )
 
 
 @dp.message(Command("ban"))
@@ -1097,13 +1243,10 @@ async def handle_message(message: Message) -> None:
     tier = state.get("tier", user_data.get("tier", "free"))
 
     if not state.get("allowed", False):
-        await log_event(user_id, "paywall_shown", {"tier": tier})
+        variant = pick_paywall_variant(user_id)
+        await log_event(user_id, "paywall_shown", {"tier": tier, "variant": variant})
         await message.answer(
-            "🔒 Лимит бесплатных сообщений закончился.\n\n"
-            "🚀 Продолжай без остановки:\n"
-            f"• Basic — {TIERS['basic']['price']} ⭐: 100 сообщений/30 дней\n"
-            f"• Pro — {TIERS['pro']['price']} ⭐: безлимит + все модели\n\n"
-            "Нажми кнопку и продолжай прямо сейчас 👇",
+            PAYWALL_VARIANTS[variant],
             reply_markup=buy_keyboard(),
         )
         return
@@ -1127,6 +1270,7 @@ async def handle_message(message: Message) -> None:
     await bot.send_chat_action(message.chat.id, "typing")
 
     try:
+        user_last_prompt[user_id] = message.text
         answer = await ask_nvidia(user_id, message.text)
         answer = format_answer(answer)
         
