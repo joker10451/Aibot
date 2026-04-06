@@ -148,9 +148,7 @@ HOMEWORK_BASE_PROMPT = (
 
 MODES = {
     "📚 Домашка": HOMEWORK_BASE_PROMPT,
-    "💸 Заработок": "Ты даешь идеи заработка и конкретные шаги. Используй эмодзи для структуры. Без символов ** и markdown.",
     "✍️ Тексты": "Ты профессиональный копирайтер, пишешь тексты. Используй эмодзи для структуры. Без символов ** и markdown.",
-    "🎬 TikTok идеи": "Ты создаешь вирусные идеи и сценарии для TikTok. Используй эмодзи для структуры. Без символов ** и markdown.",
 }
 
 HOMEWORK_ACTIONS: dict[str, str] = {
@@ -516,8 +514,7 @@ def models_keyboard(user_data: dict) -> InlineKeyboardMarkup:
 def get_main_menu() -> ReplyKeyboardMarkup:
     """Главное меню с режимами работы."""
     kb = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
-        [KeyboardButton(text="📚 Домашка"), KeyboardButton(text="💸 Заработок")],
-        [KeyboardButton(text="✍️ Тексты"), KeyboardButton(text="🎬 TikTok идеи")],
+        [KeyboardButton(text="📚 Домашка"), KeyboardButton(text="✍️ Тексты")],
         [KeyboardButton(text="🧩 Решение пошагово"), KeyboardButton(text="🧠 Объясни проще")],
         [KeyboardButton(text="🔎 Проверь ответ"), KeyboardButton(text="📝 Краткий конспект")],
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🧹 Очистить")],
@@ -529,7 +526,6 @@ def get_quick_start_menu() -> ReplyKeyboardMarkup:
     """Быстрый старт с готовыми сценариями."""
     kb = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
         [KeyboardButton(text="✍️ Написать текст"), KeyboardButton(text="📚 Сделать домашку")],
-        [KeyboardButton(text="💸 Идея заработка"), KeyboardButton(text="🎬 Сценарий TikTok")],
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🧹 Очистить")],
     ])
     return kb
@@ -564,16 +560,22 @@ async def cmd_start(message: Message) -> None:
 
     await message.answer(
         "📚 AskNeuro AI — помощник по учёбе\n\n"
+        f"{access_line}\n"
+        f"📦 Текущий тариф: {tier_name}\n\n"
         "Скинь задачу/тему — я:\n"
         "✅ решу и объясню по шагам\n"
         "🧠 объясню простыми словами\n"
         "🔎 проверю твой ответ и найду ошибки\n"
         "📝 сделаю короткий конспект\n\n"
+        "⚡ Как пользоваться за 10 секунд:\n"
+        "1) Нажми «📚 Сделать домашку» или просто напиши задачу\n"
+        "2) При необходимости выбери «🧩 Пошагово» / «🧠 Объясни проще»\n"
+        "3) Получи готовое решение и разбор\n\n"
         "Примеры:\n"
         "— «Реши: x² + 5x + 6 = 0»\n"
         "— «Объясни фотосинтез простыми словами»\n"
         "— «Проверь моё решение: ...»\n\n"
-        "Выбери режим или просто напиши задачу:",
+        "Выбери сценарий ниже или отправь задачу сразу:",
         reply_markup=get_quick_start_menu(),
     )
 
@@ -581,12 +583,21 @@ async def cmd_start(message: Message) -> None:
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(
-        "🤖 NVIDIA NIM API — выбирай модель под свой тариф.\n\n"
+        "🤖 AskNeuro AI — учебный помощник в Telegram.\n\n"
+        "Что умеет:\n"
+        "• решает задачи по шагам\n"
+        "• объясняет темы простыми словами\n"
+        "• проверяет ответы и находит ошибки\n"
+        "• делает короткие конспекты\n\n"
         "📦 Тарифы:\n"
         "• Free: 5 сообщений, 2 базовые модели\n"
         "• Basic: 100 сообщений/месяц, 4 модели (100 ⭐)\n"
         "• Pro: безлимит, все 7 моделей (200 ⭐)\n\n"
-        "Используй /model для выбора модели."
+        "Полезные команды:\n"
+        "/start — быстрый старт\n"
+        "/status — лимит и тариф\n"
+        "/model — выбор модели\n"
+        "/clear — очистить историю"
     )
 
 
@@ -618,7 +629,11 @@ async def cmd_status(message: Message) -> None:
         )
         
         if left == 0:
-            status_text += "\n\n🚀 Открой безлимит, чтобы продолжить"
+            status_text += (
+                "\n\n🚀 Лимит исчерпан.\n"
+                f"Открой Basic за {TIERS['basic']['price']} ⭐ (100 сообщений/30 дней) "
+                f"или Pro за {TIERS['pro']['price']} ⭐ (безлимит)."
+            )
         
         await message.answer(
             status_text,
@@ -741,7 +756,12 @@ async def successful_payment(message: Message) -> None:
 @dp.message(F.text.lower().in_({"доступ", "купить", "buy", "оплата"}))
 async def buy_access(message: Message) -> None:
     await message.answer(
-        f"💸 Доступ — {STARS_PRICE} ⭐ Telegram Stars\n\nНажми кнопку для оплаты:",
+        f"💸 Разблокируй доступ за {STARS_PRICE} ⭐\n\n"
+        "Что получишь сразу:\n"
+        "— больше сообщений без пауз\n"
+        "— доступ к более мощным моделям\n"
+        "— быстрые ответы для учёбы\n\n"
+        "Нажми кнопку ниже:",
         reply_markup=buy_keyboard(),
     )
 
@@ -766,28 +786,6 @@ async def quick_homework(message: Message) -> None:
     await log_event(message.from_user.id, "mode_selected", {"mode": "📚 Домашка"})
     await message.answer(
         "📚 Напиши задачу — я решу и объясню\n\nНапример:\n— \"реши уравнение x² + 5x + 6 = 0\"\n— \"объясни фотосинтез\"",
-        reply_markup=get_main_menu(),
-    )
-
-
-@dp.message(F.text == "💸 Идея заработка")
-async def quick_money(message: Message) -> None:
-    """Быстрый старт: заработок."""
-    await set_user_mode(message.from_user.id, "💸 Заработок")
-    await log_event(message.from_user.id, "mode_selected", {"mode": "💸 Заработок"})
-    await message.answer(
-        "💸 Напиши, сколько хочешь зарабатывать — я дам план\n\nНапример:\n— \"идея заработка с 0€\"\n— \"как заработать 500€/месяц\"",
-        reply_markup=get_main_menu(),
-    )
-
-
-@dp.message(F.text == "🎬 Сценарий TikTok")
-async def quick_tiktok(message: Message) -> None:
-    """Быстрый старт: TikTok."""
-    await set_user_mode(message.from_user.id, "🎬 TikTok идеи")
-    await log_event(message.from_user.id, "mode_selected", {"mode": "🎬 TikTok идеи"})
-    await message.answer(
-        "🎬 Напиши тему — я создам вирусный сценарий\n\nНапример:\n— \"сценарий про животных\"\n— \"идея для танца\"",
         reply_markup=get_main_menu(),
     )
 
@@ -1079,13 +1077,11 @@ async def handle_message(message: Message) -> None:
     if not state.get("allowed", False):
         await log_event(user_id, "paywall_shown", {"tier": tier})
         await message.answer(
-            "🔒 Бесплатные сообщения закончились\n\n"
-            "🚀 Что ты получишь:\n"
-            "— безлимитные ответы\n"
-            "— быстрый AI без очередей\n"
-            "— доступ ко всем режимам\n"
-            "— помощь с любыми задачами\n\n"
-            "💸 Разблокируй доступ и продолжи 👇",
+            "🔒 Лимит бесплатных сообщений закончился.\n\n"
+            "🚀 Продолжай без остановки:\n"
+            f"• Basic — {TIERS['basic']['price']} ⭐: 100 сообщений/30 дней\n"
+            f"• Pro — {TIERS['pro']['price']} ⭐: безлимит + все модели\n\n"
+            "Нажми кнопку и продолжай прямо сейчас 👇",
             reply_markup=buy_keyboard(),
         )
         return
@@ -1100,11 +1096,11 @@ async def handle_message(message: Message) -> None:
         if left_after == 1:
             await log_event(user_id, "free_limit_warning", {"tier": tier, "left": 1})
             await message.answer(
-                "⚠️ Остался последний бесплатный запрос!\n\n"
-                "Следующий откроет платный доступ 👇"
+                f"⚠️ Остался 1 бесплатный запрос.\n\n"
+                f"Дальше: Basic {TIERS['basic']['price']} ⭐ или Pro {TIERS['pro']['price']} ⭐."
             )
         elif left_after == 0:
-            await message.answer("⚠️ Это было последнее сообщение.")
+            await message.answer("⚠️ Это был последний бесплатный ответ. Готов открыть доступ?")
 
     await bot.send_chat_action(message.chat.id, "typing")
 
