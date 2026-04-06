@@ -8,6 +8,7 @@ from collections import defaultdict, deque
 import re
 import io
 from typing import Optional
+from pypdf import PdfReader
 from openai import OpenAI
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -36,6 +37,7 @@ MAX_TOKENS           = int(os.getenv("MAX_TOKENS", 800))  # Снижено дл�
 TEMPERATURE          = float(os.getenv("TEMPERATURE", 0.7))
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS", "firebase.json")
 FIREBASE_CREDENTIALS_JSON = os.getenv("FIREBASE_CREDENTIALS_JSON")  # raw JSON or base64 JSON
+OCR_SPACE_API_KEY    = os.getenv("OCR_SPACE_API_KEY")  # OCR для картинок через ocr.space (опционально)
 
 if not TELEGRAM_TOKEN or not NVIDIA_API_KEY:
     raise ValueError("Заполни TELEGRAM_TOKEN и NVIDIA_API_KEY в файле .env")
@@ -146,7 +148,8 @@ HOMEWORK_BASE_PROMPT = (
     "— Избегай длинной воды, пиши кратко и по делу\n"
     "— Одна мысль = один короткий абзац (1–3 строки)\n"
     "— По умолчанию отвечай КОРОТКО: без длинных эссе\n"
-    "— Длинные блоки (типичные ошибки/конспект/очень подробное объяснение) давай только если пользователь попросил\n\n"
+    "— Длинные блоки (типичные ошибки/конспект/очень подробное объяснение) давай только если пользователь попросил\n"
+    "— Не пиши обесценивающие фразы вроде «все ошибаются» или «неправильно решать через формулу»\n\n"
     "Формат ответа по умолчанию:\n"
     "✅ Ответ: ... (1 строка)\n"
     "🧩 Шаги: 2–5 коротких пунктов\n"
@@ -406,6 +409,77 @@ async def clear_history(user_id: int) -> None:
     docs = await loop.run_in_executor(None, lambda: _history_ref(user_id).get())
     for doc in docs:
         await loop.run_in_executor(None, doc.reference.delete)
+
+
+# ─── OCR / извлечение текста ─────────────────────────────────────────────────
+
+def _is_probably_low_quality_ocr(text: str, conf: Optional[float]) -> bool:
+    t = (text or "").strip()
+    if len(t) < 25:
+        return True
+    if conf is not None and conf < 0.6:
+        return True
+    letters = sum(ch.isalnum() for ch in t)
+    return letters / max(1, len(t)) < 0.35
+
+
+async def ocr_space_image(image_bytes: bytes, language: str = "rus") -> tuple[str, Optional[float]]:
+    """
+    OCR через ocr.space. Требует OCR_SPACE_API_KEY.
+    Возвращает (text, mean_confidence[0..1] | None)
+    """
+    if not OCR_SPACE_API_KEY:
+        raise RuntimeError("OCR_SPACE_API_KEY не задан")
+
+    import aiohttp
+
+    url = "https://api.ocr.space/parse/image"
+    data = aiohttp.FormData()
+    data.add_field("apikey", OCR_SPACE_API_KEY)
+    data.add_field("language", language)
+    data.add_field("isOverlayRequired", "true")
+    data.add_field("file", image_bytes, filename="image.jpg", content_type="image/jpeg")
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        async with session.post(url, data=data) as resp:
+            payload = await resp.json(content_type=None)
+
+    if isinstance(payload, dict) and payload.get("IsErroredOnProcessing"):
+        msg = payload.get("ErrorMessage") or payload.get("ErrorDetails") or "OCR error"
+        raise RuntimeError(str(msg))
+
+    parsed = (payload.get("ParsedResults") or []) if isinstance(payload, dict) else []
+    if not parsed:
+        return "", None
+
+    text = "\n".join((p.get("ParsedText") or "") for p in parsed).strip()
+
+    conf_vals: list[float] = []
+    try:
+        for p in parsed:
+            overlay = p.get("TextOverlay") or {}
+            for ln in (overlay.get("Lines") or []):
+                for w in (ln.get("Words") or []):
+                    c = w.get("WordConf")
+                    if c is None:
+                        continue
+                    conf_vals.append(float(c) / 100.0)
+    except Exception:
+        conf_vals = []
+
+    conf = (sum(conf_vals) / len(conf_vals)) if conf_vals else None
+    return text, conf
+
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    out: list[str] = []
+    for page in reader.pages[:20]:
+        try:
+            out.append(page.extract_text() or "")
+        except Exception:
+            continue
+    return "\n".join(out).strip()
 
 
 # ─── Вспомогательные функции ─────────────────────────────────────────────────
@@ -675,6 +749,15 @@ def homework_details_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def ocr_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Использовать текст", callback_data="ocr:confirm"),
+            InlineKeyboardButton(text="✏️ Отмена", callback_data="ocr:cancel"),
+        ]
+    ])
+
+
 def models_keyboard(user_data: dict) -> InlineKeyboardMarkup:
     available = get_available_models(user_data)
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -936,6 +1019,32 @@ async def callback_homework_detail(call: CallbackQuery) -> None:
 
     regen_prompt = f"{last_prompt}\n\nДоп. требование:\n{action}"
     answer = await ask_nvidia(user_id, regen_prompt, append_user_message=False)
+    answer = format_answer(answer)
+    for part in split_text(answer):
+        await call.message.answer(part)
+
+
+@dp.callback_query(F.data == "ocr:cancel")
+async def callback_ocr_cancel(call: CallbackQuery) -> None:
+    user_pending_ocr.pop(call.from_user.id, None)
+    await call.answer("Ок", show_alert=False)
+
+
+@dp.callback_query(F.data == "ocr:confirm")
+async def callback_ocr_confirm(call: CallbackQuery) -> None:
+    user_id = call.from_user.id
+    pending = user_pending_ocr.pop(user_id, None)
+    if not pending or not (pending.get("text") or "").strip():
+        await call.answer("Нечего подтверждать.", show_alert=True)
+        return
+
+    # Тут не инкрементим лимит: он уже списан при загрузке фото/файла
+    text = pending["text"].strip()
+    user_last_prompt[user_id] = text
+    await call.answer("Делаю…")
+    await bot.send_chat_action(call.message.chat.id, "typing")
+
+    answer = await ask_nvidia(user_id, text)
     answer = format_answer(answer)
     for part in split_text(answer):
         await call.message.answer(part)
@@ -1577,6 +1686,174 @@ async def handle_message(message: Message) -> None:
             "⚠️ Сервер загружен, попробуй ещё раз через пару секунд\n\n"
             "Если проблема повторяется — напиши /help"
         )
+
+
+@dp.message(F.photo)
+async def handle_photo(message: Message) -> None:
+    user_id = message.from_user.id
+    user_data = await get_user(user_id)
+
+    # списываем лимит за обработку фото как за сообщение
+    state = await check_access_and_maybe_increment(user_id)
+    tier = state.get("tier", user_data.get("tier", "free"))
+    if not state.get("allowed", False):
+        variant = pick_paywall_variant(user_id)
+        await log_event(user_id, "paywall_shown", {"tier": tier, "variant": variant})
+        await message.answer(PAYWALL_VARIANTS[variant], reply_markup=buy_keyboard())
+        return
+
+    if not message.photo:
+        await message.answer("Не вижу фото. Пришли картинку ещё раз.")
+        return
+
+    if not OCR_SPACE_API_KEY:
+        await message.answer(
+            "📸 Я могу решать задачи по фото, но OCR не настроен.\n\n"
+            "Чтобы включить распознавание, добавь в Render env переменную `OCR_SPACE_API_KEY`.\n"
+            "Пока что: отправь задачу текстом."
+        )
+        return
+
+    file_id = message.photo[-1].file_id
+    tg_file = await bot.get_file(file_id)
+    raw = await bot.download_file(tg_file.file_path)
+    image_bytes = raw.read() if hasattr(raw, "read") else bytes(raw)
+
+    await message.answer("🔎 Распознаю текст с фото…")
+    try:
+        text, conf = await ocr_space_image(image_bytes, language="rus")
+    except Exception as e:
+        await log_event(user_id, "ocr_error", {"error": str(e)[:300]})
+        await message.answer("⚠️ Не получилось распознать текст. Попробуй другое фото или пришли текстом.")
+        return
+
+    text = (text or "").strip()
+    if not text:
+        await message.answer("⚠️ На фото не нашёл текста. Попробуй сфоткать ближе/чётче или пришли текстом.")
+        return
+
+    user_pending_ocr[user_id] = {"text": text, "conf": conf, "ts": __import__('time').time()}
+
+    if _is_probably_low_quality_ocr(text, conf):
+        preview = text[:800]
+        await message.answer(
+            "Я распознал текст, но качество может быть неидеальным.\n\n"
+            f"Текст:\n{preview}\n\n"
+            "Использовать его для решения?",
+            reply_markup=ocr_confirm_keyboard(),
+        )
+    else:
+        # auto-confirm
+        user_last_prompt[user_id] = text
+        answer = await ask_nvidia(user_id, text)
+        answer = format_answer(answer)
+        for part in split_text(answer):
+            await message.answer(part)
+
+
+@dp.message(F.document)
+async def handle_document(message: Message) -> None:
+    user_id = message.from_user.id
+    user_data = await get_user(user_id)
+
+    state = await check_access_and_maybe_increment(user_id)
+    tier = state.get("tier", user_data.get("tier", "free"))
+    if not state.get("allowed", False):
+        variant = pick_paywall_variant(user_id)
+        await log_event(user_id, "paywall_shown", {"tier": tier, "variant": variant})
+        await message.answer(PAYWALL_VARIANTS[variant], reply_markup=buy_keyboard())
+        return
+
+    doc = message.document
+    if not doc:
+        await message.answer("Не вижу файл. Пришли ещё раз.")
+        return
+
+    filename = (doc.file_name or "").lower()
+    tg_file = await bot.get_file(doc.file_id)
+    raw = await bot.download_file(tg_file.file_path)
+    file_bytes = raw.read() if hasattr(raw, "read") else bytes(raw)
+
+    # 1) txt
+    if filename.endswith(".txt"):
+        try:
+            text = file_bytes.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            text = ""
+        if not text:
+            await message.answer("⚠️ Не смог прочитать текст из .txt. Попробуй другой файл.")
+            return
+        user_last_prompt[user_id] = text
+        answer = await ask_nvidia(user_id, text)
+        answer = format_answer(answer)
+        for part in split_text(answer):
+            await message.answer(part)
+        return
+
+    # 2) pdf (извлекаем текст, OCR для сканов опционально)
+    if filename.endswith(".pdf"):
+        await message.answer("📄 Читаю PDF…")
+        text = ""
+        try:
+            text = extract_text_from_pdf(file_bytes)
+        except Exception as e:
+            await log_event(user_id, "pdf_extract_error", {"error": str(e)[:300]})
+            text = ""
+
+        if text and len(text) >= 25:
+            user_last_prompt[user_id] = text
+            answer = await ask_nvidia(user_id, text)
+            answer = format_answer(answer)
+            for part in split_text(answer):
+                await message.answer(part)
+            return
+
+        await message.answer(
+            "⚠️ Похоже, это скан без текста (или не смог извлечь текст).\n"
+            "Если это картинка в PDF — пришли фото страницы или вставь текст."
+        )
+        return
+
+    # 3) картинки как document (jpg/png)
+    if filename.endswith((".jpg", ".jpeg", ".png", ".webp")):
+        if not OCR_SPACE_API_KEY:
+            await message.answer(
+                "📎 Получил картинку файлом, но OCR не настроен.\n\n"
+                "Добавь `OCR_SPACE_API_KEY` в Render env или пришли задачу текстом."
+            )
+            return
+        await message.answer("🔎 Распознаю текст из файла…")
+        try:
+            text, conf = await ocr_space_image(file_bytes, language="rus")
+        except Exception as e:
+            await log_event(user_id, "ocr_error", {"error": str(e)[:300]})
+            await message.answer("⚠️ Не получилось распознать. Попробуй другой файл или пришли текстом.")
+            return
+        text = (text or "").strip()
+        if not text:
+            await message.answer("⚠️ В файле не нашёл текста. Пришли другое изображение или текстом.")
+            return
+        user_pending_ocr[user_id] = {"text": text, "conf": conf, "ts": __import__('time').time()}
+        if _is_probably_low_quality_ocr(text, conf):
+            preview = text[:800]
+            await message.answer(
+                "Я распознал текст, но качество может быть неидеальным.\n\n"
+                f"Текст:\n{preview}\n\n"
+                "Использовать его для решения?",
+                reply_markup=ocr_confirm_keyboard(),
+            )
+        else:
+            user_last_prompt[user_id] = text
+            answer = await ask_nvidia(user_id, text)
+            answer = format_answer(answer)
+            for part in split_text(answer):
+                await message.answer(part)
+        return
+
+    await message.answer(
+        "Я умею читать .txt и .pdf (если PDF содержит текст), и распознавать текст с картинок.\n"
+        "Поддержка: .txt, .pdf, .jpg/.png."
+    )
 
 
 @dp.message()
