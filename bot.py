@@ -1,6 +1,9 @@
 import asyncio
+import base64
+import json
 import logging
 import os
+import tempfile
 from openai import OpenAI
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -10,6 +13,7 @@ from aiogram.types import (
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
+from aiohttp import web
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -27,18 +31,66 @@ MAX_HISTORY          = int(os.getenv("MAX_HISTORY", 20))
 MAX_TOKENS           = int(os.getenv("MAX_TOKENS", 800))  # Снижено для экономии
 TEMPERATURE          = float(os.getenv("TEMPERATURE", 0.7))
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS", "firebase.json")
+FIREBASE_CREDENTIALS_JSON = os.getenv("FIREBASE_CREDENTIALS_JSON")  # raw JSON or base64 JSON
 
 if not TELEGRAM_TOKEN or not NVIDIA_API_KEY:
     raise ValueError("Заполни TELEGRAM_TOKEN и NVIDIA_API_KEY в файле .env")
 
 # ─── Firebase Firestore ───────────────────────────────────────────────────────
-cred = credentials.Certificate(FIREBASE_CREDENTIALS)
+def _resolve_firebase_credentials_path() -> str:
+    """
+    Поддержка Render/CI: можно передать credentials через env,
+    чтобы не хранить ключи сервис-аккаунта как файл в репозитории.
+    """
+    if not FIREBASE_CREDENTIALS_JSON:
+        return FIREBASE_CREDENTIALS
+
+    raw = FIREBASE_CREDENTIALS_JSON.strip()
+    try:
+        if raw.startswith("{"):
+            payload = json.loads(raw)
+        else:
+            decoded = base64.b64decode(raw).decode("utf-8")
+            payload = json.loads(decoded)
+    except Exception as e:
+        raise ValueError(f"Некорректный FIREBASE_CREDENTIALS_JSON: {e}")
+
+    tmp_dir = tempfile.gettempdir()
+    tmp_path = os.path.join(tmp_dir, "firebase_credentials.json")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    return tmp_path
+
+
+cred = credentials.Certificate(_resolve_firebase_credentials_path())
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 # Коллекции:
 #   users/{user_id}  → { messages_used, paid, model, username }
 #   history/{user_id}/messages/{doc_id} → { role, content, ts }
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Analytics events (минимум для воронки) ───────────────────────────────────
+def _events_ref():
+    return db.collection("events")
+
+
+async def log_event(user_id: int | None, event: str, meta: dict | None = None) -> None:
+    """Пишем событие в Firestore. Ошибки не должны ломать бота."""
+    payload = {
+        "event": event,
+        "ts": firestore.SERVER_TIMESTAMP,
+    }
+    if user_id is not None:
+        payload["user_id"] = int(user_id)
+    if meta:
+        payload["meta"] = meta
+
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, lambda: _events_ref().add(payload))
+    except Exception as e:
+        logger.warning(f"Не удалось записать event={event}: {e}")
 
 # ─── Доступные модели по тарифам ─────────────────────────────────────────────
 # Free: только базовые модели
@@ -77,15 +129,40 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ─── Режимы работы бота ──────────────────────────────────────────────────────
+HOMEWORK_BASE_PROMPT = (
+    "Ты учебный ассистент. Решай задачи и объясняй так, чтобы понял ученик.\n\n"
+    "Правила:\n"
+    "— Без символов ** и любой markdown-разметки\n"
+    "— Используй эмодзи для структуры и короткие абзацы\n"
+    "— Если данных не хватает — задай 1–3 уточняющих вопроса\n"
+    "— Не выдумывай факты, формулы и условия\n\n"
+    "Формат ответа (если уместно):\n"
+    "✅ Ответ: ...\n"
+    "🧩 Решение по шагам:\n"
+    "1) ...\n"
+    "2) ...\n"
+    "🧠 Объяснение простыми словами: ...\n"
+    "🔎 Проверка / типичные ошибки: ...\n"
+    "📝 Краткий конспект: ...\n"
+)
+
 MODES = {
-    "📚 Домашка": "Ты помогаешь с учебой, решаешь задачи и объясняешь просто. Используй эмодзи для структуры. Без символов ** и markdown.",
+    "📚 Домашка": HOMEWORK_BASE_PROMPT,
     "💸 Заработок": "Ты даешь идеи заработка и конкретные шаги. Используй эмодзи для структуры. Без символов ** и markdown.",
     "✍️ Тексты": "Ты профессиональный копирайтер, пишешь тексты. Используй эмодзи для структуры. Без символов ** и markdown.",
     "🎬 TikTok идеи": "Ты создаешь вирусные идеи и сценарии для TikTok. Используй эмодзи для структуры. Без символов ** и markdown.",
 }
 
+HOMEWORK_ACTIONS: dict[str, str] = {
+    "🧩 Решение пошагово": "Сделай решение максимально пошаговым, без пропусков, с пояснениями каждого шага.",
+    "🧠 Объясни проще": "Объясни очень простыми словами, как для новичка, с аналогиями и примерами.",
+    "🔎 Проверь ответ": "Проверь решение/ответ пользователя: найди ошибки, объясни где и как исправить, потом дай правильный вариант.",
+    "📝 Краткий конспект": "В конце добавь очень короткий конспект по теме (5–7 пунктов).",
+}
+
 user_modes = {}  # {user_id: system_prompt}
 user_last_request = {}  # {user_id: timestamp} — защита от спама
+user_pending_homework_action = {}  # {user_id: action_instruction}
 
 SYSTEM_PROMPT = {
     "role": "system",
@@ -143,10 +220,19 @@ async def get_user(user_id: int) -> dict:
         "tier": "free",
         "model": NVIDIA_MODEL,
         "username": "",
+        "mode": "📚 Домашка",
         "last_reset": datetime.datetime.now(datetime.timezone.utc),
     }
     await loop.run_in_executor(None, lambda: _user_ref(user_id).set(data))
     return data
+
+
+async def set_user_mode(user_id: int, mode_key: str) -> None:
+    """Сохраняет режим в памяти и Firestore."""
+    if mode_key not in MODES:
+        return
+    user_modes[user_id] = MODES[mode_key]
+    await update_user(user_id, {"mode": mode_key})
 
 
 async def update_user(user_id: int, data: dict) -> None:
@@ -154,6 +240,86 @@ async def update_user(user_id: int, data: dict) -> None:
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, lambda: _user_ref(user_id).update(data))
 
+
+async def check_access_and_maybe_increment(user_id: int) -> dict:
+    """
+    Атомарно проверяет лимит и инкрементит `messages_used` (кроме pro).
+    Также делает месячный reset для basic/pro в той же транзакции.
+
+    Возвращает:
+      {
+        allowed: bool,
+        tier: str,
+        prev_used: int,
+        new_used: int,
+        left_after: int,
+        did_reset: bool,
+      }
+    """
+    import datetime
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    user_ref = _user_ref(user_id)
+
+    def _tx():
+        transaction = db.transaction()
+
+        @firestore.transactional
+        def _run(transaction_obj):
+            snap = user_ref.get(transaction=transaction_obj)
+            data = snap.to_dict() or {}
+
+            tier = data.get("tier", "free")
+            limit = TIERS.get(tier, TIERS["free"])["limit"]
+            prev_used = int(data.get("messages_used", 0) or 0)
+
+            did_reset = False
+            if tier in {"basic", "pro"}:
+                last_reset = data.get("last_reset")
+                if last_reset and (now - last_reset).days >= 30:
+                    prev_used = 0
+                    did_reset = True
+                    transaction_obj.update(user_ref, {"messages_used": 0, "last_reset": now})
+
+            # Pro — безлимит, не считаем сообщения
+            if limit == -1:
+                return {
+                    "allowed": True,
+                    "tier": tier,
+                    "prev_used": prev_used,
+                    "new_used": prev_used,
+                    "left_after": 999,
+                    "did_reset": did_reset,
+                }
+
+            # Если лимит исчерпан — не инкрементим
+            if prev_used >= limit:
+                return {
+                    "allowed": False,
+                    "tier": tier,
+                    "prev_used": prev_used,
+                    "new_used": prev_used,
+                    "left_after": 0,
+                    "did_reset": did_reset,
+                }
+
+            new_used = prev_used + 1
+            transaction_obj.update(user_ref, {"messages_used": new_used})
+            left_after = max(0, limit - new_used)
+
+            return {
+                "allowed": True,
+                "tier": tier,
+                "prev_used": prev_used,
+                "new_used": new_used,
+                "left_after": left_after,
+                "did_reset": did_reset,
+            }
+
+        return _run(transaction)
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _tx)
 
 async def get_history(user_id: int) -> list[dict]:
     """Загрузить историю диалога из Firestore (последние MAX_HISTORY сообщений)."""
@@ -247,14 +413,6 @@ def remaining_from(user_data: dict) -> int:
     return max(0, limit - user_data.get("messages_used", 0))
 
 
-def has_access_from(user_data: dict) -> bool:
-    tier = user_data.get("tier", "free")
-    limit = TIERS[tier]["limit"]
-    if limit == -1:  # безлимит
-        return True
-    return user_data.get("messages_used", 0) < limit
-
-
 def get_available_models(user_data: dict) -> dict[str, str]:
     """Возвращает доступные модели для тарифа пользователя."""
     tier = user_data.get("tier", "free")
@@ -303,11 +461,25 @@ async def ask_nvidia(user_id: int, user_text: str) -> str:
     user_data = await get_user(user_id)
     model = user_data.get("model", NVIDIA_MODEL)
 
-    # Получаем system prompt (режим работы или дефолтный)
-    if user_id in user_modes:
-        system_prompt = {"role": "system", "content": user_modes[user_id]}
+    # Восстанавливаем режим из Firestore (если кэш пуст)
+    if user_id not in user_modes:
+        mode_key = user_data.get("mode") or "📚 Домашка"
+        if mode_key in MODES:
+            user_modes[user_id] = MODES[mode_key]
+
+    # Получаем system prompt (режим + разовая учебная инструкция)
+    base_prompt = user_modes.get(user_id)
+    if not base_prompt:
+        base_prompt = SYSTEM_PROMPT["content"]
+
+    action = user_pending_homework_action.pop(user_id, None)
+    if action:
+        system_prompt = {
+            "role": "system",
+            "content": f"{base_prompt}\n\nДоп. требование:\n{action}",
+        }
     else:
-        system_prompt = SYSTEM_PROMPT
+        system_prompt = {"role": "system", "content": base_prompt}
 
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
@@ -346,6 +518,8 @@ def get_main_menu() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
         [KeyboardButton(text="📚 Домашка"), KeyboardButton(text="💸 Заработок")],
         [KeyboardButton(text="✍️ Тексты"), KeyboardButton(text="🎬 TikTok идеи")],
+        [KeyboardButton(text="🧩 Решение пошагово"), KeyboardButton(text="🧠 Объясни проще")],
+        [KeyboardButton(text="🔎 Проверь ответ"), KeyboardButton(text="📝 Краткий конспект")],
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🧹 Очистить")],
     ])
     return kb
@@ -372,6 +546,8 @@ async def cmd_start(message: Message) -> None:
     user_data = await get_user(user_id)
     user_data = await check_and_reset_limits(user_id, user_data)
 
+    await log_event(user_id, "start")
+
     # Сохраняем username при первом старте
     if not user_data.get("username"):
         await update_user(user_id, {"username": message.from_user.username or ""})
@@ -387,13 +563,17 @@ async def cmd_start(message: Message) -> None:
         access_line = f"🆓 Бесплатно: {left} сообщений"
 
     await message.answer(
-        "🤖 AskNeuro AI — нейросеть, которая делает за тебя\n\n"
-        "Я могу за 10 секунд:\n"
-        "✍️ написать сочинение или пост\n"
-        "📚 решить домашку и объяснить\n"
-        "💸 дать идею заработка с планом\n"
-        "🎬 придумать сценарий для TikTok\n\n"
-        "👇 Выбери, что нужно сделать:",
+        "📚 AskNeuro AI — помощник по учёбе\n\n"
+        "Скинь задачу/тему — я:\n"
+        "✅ решу и объясню по шагам\n"
+        "🧠 объясню простыми словами\n"
+        "🔎 проверю твой ответ и найду ошибки\n"
+        "📝 сделаю короткий конспект\n\n"
+        "Примеры:\n"
+        "— «Реши: x² + 5x + 6 = 0»\n"
+        "— «Объясни фотосинтез простыми словами»\n"
+        "— «Проверь моё решение: ...»\n\n"
+        "Выбери режим или просто напиши задачу:",
         reply_markup=get_quick_start_menu(),
     )
 
@@ -427,14 +607,14 @@ async def cmd_status(message: Message) -> None:
     model = user_data.get("model", NVIDIA_MODEL)
 
     if tier == "pro":
-        await message.answer(f"✅ Тариф: Pro (безлимит)\nМодель: `{model}`", parse_mode="Markdown")
+        await message.answer(f"✅ Тариф: Pro (безлимит)\nМодель: {model}")
     else:
         left = remaining_from(user_data)
         limit = TIERS[tier]["limit"]
         status_text = (
             f"📦 Тариф: {tier_name}\n"
             f"📊 Использовано: {user_data.get('messages_used', 0)}/{limit}\n"
-            f"Осталось: {left}\nМодель: `{model}`"
+            f"Осталось: {left}\nМодель: {model}"
         )
         
         if left == 0:
@@ -442,7 +622,6 @@ async def cmd_status(message: Message) -> None:
         
         await message.answer(
             status_text,
-            parse_mode="Markdown",
             reply_markup=buy_keyboard() if left == 0 else None,
         )
 
@@ -452,9 +631,8 @@ async def cmd_model(message: Message) -> None:
     user_data = await get_user(message.from_user.id)
     tier = user_data.get("tier", "free")
     await message.answer(
-        f"🤖 Текущая модель: `{user_data.get('model', NVIDIA_MODEL)}`\n"
+        f"🤖 Текущая модель: {user_data.get('model', NVIDIA_MODEL)}\n"
         f"📦 Тариф: {TIERS[tier]['name']}\n\nВыбери новую:",
-        parse_mode="Markdown",
         reply_markup=models_keyboard(user_data),
     )
 
@@ -471,15 +649,17 @@ async def callback_model(call: CallbackQuery) -> None:
         return
     
     await update_user(call.from_user.id, {"model": model_id})
+    await log_event(call.from_user.id, "model_changed", {"model": model_id})
     available = get_available_models(user_data)
     label = next((k for k, v in available.items() if v == model_id), model_id)
-    await call.message.answer(f"✅ Модель: {label}\n`{model_id}`", parse_mode="Markdown")
+    await call.message.answer(f"✅ Модель: {label}\n{model_id}")
     await call.answer()
 
 
 @dp.callback_query(F.data == "buy")
 async def callback_buy(call: CallbackQuery) -> None:
     """Отправляем инвойс Telegram Stars при нажатии кнопки."""
+    await log_event(call.from_user.id, "invoice_sent", {"price": STARS_PRICE})
     await bot.send_invoice(
         chat_id=call.from_user.id,
         title="Доступ к AskNeuro AI",
@@ -515,9 +695,11 @@ async def successful_payment(message: Message) -> None:
     import datetime
     await update_user(user_id, {
         "tier": tier,
+        "paid": tier != "free",
         "messages_used": 0,
         "last_reset": datetime.datetime.now(datetime.timezone.utc),
     })
+    await log_event(user_id, "payment_success", {"stars": stars, "tier": tier})
 
     tier_name = TIERS[tier]["name"]
     limit = TIERS[tier]["limit"]
@@ -569,7 +751,8 @@ async def buy_access(message: Message) -> None:
 @dp.message(F.text == "✍️ Написать текст")
 async def quick_write_text(message: Message) -> None:
     """Быстрый старт: написать текст."""
-    user_modes[message.from_user.id] = MODES["✍️ Тексты"]
+    await set_user_mode(message.from_user.id, "✍️ Тексты")
+    await log_event(message.from_user.id, "mode_selected", {"mode": "✍️ Тексты"})
     await message.answer(
         "✍️ Напиши тему — я создам текст\n\nНапример:\n— \"пост про путешествия\"\n— \"сочинение про экологию\"",
         reply_markup=get_main_menu(),
@@ -579,7 +762,8 @@ async def quick_write_text(message: Message) -> None:
 @dp.message(F.text == "📚 Сделать домашку")
 async def quick_homework(message: Message) -> None:
     """Быстрый старт: домашка."""
-    user_modes[message.from_user.id] = MODES["📚 Домашка"]
+    await set_user_mode(message.from_user.id, "📚 Домашка")
+    await log_event(message.from_user.id, "mode_selected", {"mode": "📚 Домашка"})
     await message.answer(
         "📚 Напиши задачу — я решу и объясню\n\nНапример:\n— \"реши уравнение x² + 5x + 6 = 0\"\n— \"объясни фотосинтез\"",
         reply_markup=get_main_menu(),
@@ -589,7 +773,8 @@ async def quick_homework(message: Message) -> None:
 @dp.message(F.text == "💸 Идея заработка")
 async def quick_money(message: Message) -> None:
     """Быстрый старт: заработок."""
-    user_modes[message.from_user.id] = MODES["💸 Заработок"]
+    await set_user_mode(message.from_user.id, "💸 Заработок")
+    await log_event(message.from_user.id, "mode_selected", {"mode": "💸 Заработок"})
     await message.answer(
         "💸 Напиши, сколько хочешь зарабатывать — я дам план\n\nНапример:\n— \"идея заработка с 0€\"\n— \"как заработать 500€/месяц\"",
         reply_markup=get_main_menu(),
@@ -599,7 +784,8 @@ async def quick_money(message: Message) -> None:
 @dp.message(F.text == "🎬 Сценарий TikTok")
 async def quick_tiktok(message: Message) -> None:
     """Быстрый старт: TikTok."""
-    user_modes[message.from_user.id] = MODES["🎬 TikTok идеи"]
+    await set_user_mode(message.from_user.id, "🎬 TikTok идеи")
+    await log_event(message.from_user.id, "mode_selected", {"mode": "🎬 TikTok идеи"})
     await message.answer(
         "🎬 Напиши тему — я создам вирусный сценарий\n\nНапример:\n— \"сценарий про животных\"\n— \"идея для танца\"",
         reply_markup=get_main_menu(),
@@ -611,12 +797,35 @@ async def set_mode(message: Message) -> None:
     """Установка режима работы бота."""
     user_id = message.from_user.id
     mode_text = message.text
-    user_modes[user_id] = MODES[mode_text]
+    await set_user_mode(user_id, mode_text)
+    await log_event(user_id, "mode_selected", {"mode": mode_text})
     
     await message.answer(
         f"✅ Режим выбран: {mode_text}\n\nТеперь напиши свой запрос 👇",
         reply_markup=get_main_menu(),
     )
+
+
+@dp.message(F.text.in_(list(HOMEWORK_ACTIONS.keys())))
+async def set_homework_action(message: Message) -> None:
+    """Быстрые учебные действия (пошагово/проще/проверка/конспект)."""
+    user_id = message.from_user.id
+    action = message.text
+    await set_user_mode(user_id, "📚 Домашка")
+    user_pending_homework_action[user_id] = HOMEWORK_ACTIONS[action]
+
+    if action == "🔎 Проверь ответ":
+        hint = (
+            "🔎 Ок! Пришли своё решение/ответ целиком.\n"
+            "Если есть условие задачи — добавь его сверху."
+        )
+    else:
+        hint = (
+            "📚 Ок! Пришли задачу/тему.\n"
+            "Чем точнее условие, тем лучше результат."
+        )
+
+    await message.answer(hint, reply_markup=get_main_menu())
 
 
 @dp.message(F.text == "📊 Статус")
@@ -634,18 +843,35 @@ async def menu_clear(message: Message) -> None:
 
 @dp.message(Command("grant"))
 async def cmd_grant(message: Message) -> None:
-    """Выдать платный доступ: /grant <user_id>"""
+    """Выдать доступ: /grant <user_id> [free|basic|pro]"""
     if message.from_user.id != ADMIN_ID:
         return
     args = message.text.split()
     if len(args) < 2:
-        await message.answer("Использование: /grant <user_id>")
+        await message.answer("Использование: /grant <user_id> [free|basic|pro]")
         return
     try:
         target_id = int(args[1])
-        await update_user(target_id, {"paid": True})
-        await message.answer(f"✅ Доступ выдан: {target_id}")
-        await bot.send_message(target_id, "🎉 Доступ активирован! Лимитов больше нет.")
+        tier = (args[2].strip().lower() if len(args) >= 3 else "pro")
+        if tier not in TIERS:
+            await message.answer("❌ Неверный tier. Используй: free, basic или pro")
+            return
+
+        import datetime
+        await update_user(target_id, {
+            "tier": tier,
+            "paid": tier != "free",
+            "messages_used": 0,
+            "last_reset": datetime.datetime.now(datetime.timezone.utc),
+        })
+        await message.answer(f"✅ Тариф установлен: {target_id} → {TIERS[tier]['name']}")
+        if tier == "pro":
+            note = "🎉 Доступ активирован! Теперь у тебя Pro (безлимит)."
+        elif tier == "basic":
+            note = "🎉 Доступ активирован! Теперь у тебя Basic (100 сообщений/30 дней)."
+        else:
+            note = "ℹ️ Тариф изменён на Free."
+        await bot.send_message(target_id, note)
     except ValueError:
         await message.answer("❌ Неверный user_id")
     except Exception as e:
@@ -664,7 +890,7 @@ async def cmd_admin(message: Message) -> None:
         )
         users = [d.to_dict() for d in users_docs]
         total   = len(users)
-        paid    = sum(1 for u in users if u.get("paid"))
+        paid    = sum(1 for u in users if u.get("tier") in {"basic", "pro"})
         blocked = sum(1 for u in users if u.get("banned"))
         msgs    = sum(u.get("messages_used", 0) for u in users)
 
@@ -682,6 +908,79 @@ async def cmd_admin(message: Message) -> None:
         )
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
+
+
+@dp.message(Command("funnel"))
+async def cmd_funnel(message: Message) -> None:
+    """/funnel [days] — воронка событий за N дней (по умолчанию 7)."""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    args = message.text.split()
+    days = 7
+    if len(args) >= 2:
+        try:
+            days = int(args[1])
+        except ValueError:
+            days = 7
+    days = max(1, min(days, 60))
+
+    import datetime
+    since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+    event_names = [
+        "start",
+        "first_message",
+        "paywall_shown",
+        "invoice_sent",
+        "payment_success",
+    ]
+
+    loop = asyncio.get_event_loop()
+
+    def _load_recent_events() -> list[dict]:
+        docs = (
+            db.collection("events")
+            .where("ts", ">=", since)
+            .order_by("ts", direction=firestore.Query.DESCENDING)
+            .limit(5000)
+            .get()
+        )
+        return [d.to_dict() for d in docs]
+
+    try:
+        events = await loop.run_in_executor(None, _load_recent_events)
+    except Exception as e:
+        await message.answer(f"Ошибка чтения events: {e}")
+        return
+
+    counts = {k: 0 for k in event_names}
+    for ev in events:
+        name = ev.get("event")
+        if name in counts:
+            counts[name] += 1
+
+    start = counts["start"]
+    first = counts["first_message"]
+    paywall = counts["paywall_shown"]
+    invoice = counts["invoice_sent"]
+    paid = counts["payment_success"]
+
+    def pct(num: int, den: int) -> str:
+        if den <= 0:
+            return "—"
+        return f"{(num / den) * 100:.1f}%"
+
+    text = (
+        f"Воронка за {days} дн.\n\n"
+        f"start: {start}\n"
+        f"first_message: {first} (от start: {pct(first, start)})\n"
+        f"paywall_shown: {paywall} (от first: {pct(paywall, first)})\n"
+        f"invoice_sent: {invoice} (от paywall: {pct(invoice, paywall)})\n"
+        f"payment_success: {paid} (от invoice: {pct(paid, invoice)})\n\n"
+        f"Итог start→payment: {pct(paid, start)}\n"
+        "Примечание: считаются события из `events` (ограничение выборки 5000 записей)."
+    )
+    await message.answer(text)
 
 
 @dp.message(Command("ban"))
@@ -758,7 +1057,6 @@ async def cmd_broadcast(message: Message) -> None:
 async def handle_message(message: Message) -> None:
     user_id   = message.from_user.id
     user_data = await get_user(user_id)
-    user_data = await check_and_reset_limits(user_id, user_data)
 
     # Проверка бана
     if user_data.get("banned"):
@@ -774,9 +1072,12 @@ async def handle_message(message: Message) -> None:
         return
     user_last_request[user_id] = current_time
 
-    if not has_access_from(user_data):
-        tier = user_data.get("tier", "free")
-        limit = TIERS[tier]["limit"]
+    # Атомарно проверяем лимит и увеличиваем счётчик
+    state = await check_access_and_maybe_increment(user_id)
+    tier = state.get("tier", user_data.get("tier", "free"))
+
+    if not state.get("allowed", False):
+        await log_event(user_id, "paywall_shown", {"tier": tier})
         await message.answer(
             "🔒 Бесплатные сообщения закончились\n\n"
             "🚀 Что ты получишь:\n"
@@ -790,21 +1091,19 @@ async def handle_message(message: Message) -> None:
         return
 
     # ВАУ-эффект для первого сообщения
-    if user_data.get("messages_used", 0) == 0:
+    if int(state.get("prev_used", 0) or 0) == 0:
+        await log_event(user_id, "first_message", {"tier": tier})
         await message.answer("⚡ Сейчас покажу, что я умею...")
 
-    # Счётчик (для всех кроме pro)
-    tier = user_data.get("tier", "free")
     if tier != "pro":
-        new_count = user_data.get("messages_used", 0) + 1
-        await update_user(user_id, {"messages_used": new_count})
-        left = max(0, TIERS[tier]["limit"] - new_count)
-        if left == 1:
+        left_after = int(state.get("left_after", 0) or 0)
+        if left_after == 1:
+            await log_event(user_id, "free_limit_warning", {"tier": tier, "left": 1})
             await message.answer(
                 "⚠️ Остался последний бесплатный запрос!\n\n"
                 "Следующий откроет платный доступ 👇"
             )
-        elif left == 0:
+        elif left_after == 0:
             await message.answer("⚠️ Это было последнее сообщение.")
 
     await bot.send_chat_action(message.chat.id, "typing")
@@ -823,6 +1122,7 @@ async def handle_message(message: Message) -> None:
             await message.answer(part)
     except Exception as e:
         logger.error(f"Ошибка NVIDIA API: {e}")
+        await log_event(user_id, "error_nvidia", {"error": str(e)[:300]})
         await message.answer(
             "⚠️ Сервер загружен, попробуй ещё раз через пару секунд\n\n"
             "Если проблема повторяется — напиши /help"
@@ -837,6 +1137,20 @@ async def handle_other(message: Message) -> None:
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 async def main() -> None:
     logger.info(f"Бот запущен. Модель: {NVIDIA_MODEL}")
+
+    # Render Web Service ожидает открытый порт. Поднимаем минимальный health endpoint.
+    async def health(_request: web.Request) -> web.Response:
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logger.info(f"Health endpoint: /health on port {port}")
+
     await dp.start_polling(bot)
 
 

@@ -1,6 +1,7 @@
 # Секретные данные
 .env
 firebase.json
+*.json
 
 # Python
 __pycache__/
