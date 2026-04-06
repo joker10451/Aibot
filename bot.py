@@ -284,6 +284,7 @@ async def get_user(user_id: int) -> dict:
         "model": NVIDIA_MODEL,
         "username": "",
         "mode": "📚 Домашка",
+        "model_auto": True,
         "bonus_messages": 0,
         "referred_by": None,
         "referral_rewarded": False,
@@ -633,6 +634,47 @@ def get_available_models(user_data: dict) -> dict[str, str]:
     return TIERS[tier]["models"]
 
 
+def pick_model_for_request(user_data: dict, user_text: str) -> str:
+    """
+    Простая авто-маршрутизация модели.
+    Если пользователь выбирал модель вручную (model_auto=False) — используем её.
+    Иначе выбираем из доступных по тарифу.
+    """
+    available = list(get_available_models(user_data).values())
+    if not available:
+        return user_data.get("model", NVIDIA_MODEL) or NVIDIA_MODEL
+
+    # Если пользователь вручную выбрал модель — не трогаем
+    if user_data.get("model_auto") is False and user_data.get("model"):
+        return user_data["model"]
+
+    t = (user_text or "").lower()
+    is_math = any(ch in user_text for ch in ["=", "√", "^", "∫", "Σ", "Δ", "π"]) or ("x^" in t) or ("x²" in t)
+    is_code = any(k in t for k in ["python", "java", "c++", "javascript", "ошибка", "traceback", "stacktrace", "sql", "код"])
+    long = len(user_text) > 600
+
+    # приоритетные цели
+    preferred = []
+    if is_math or is_code or long:
+        preferred = [
+            "meta/llama-3.3-70b-instruct",
+            "meta/llama-3.1-70b-instruct",
+            "nvidia/llama-3.1-nemotron-70b-instruct",
+        ]
+    else:
+        preferred = [
+            "z-ai/glm4_7",
+            "mistralai/mistral-7b-instruct-v0.3",
+            "meta/llama-3.1-70b-instruct",
+        ]
+
+    for mid in preferred:
+        if mid in available:
+            return mid
+
+    return available[0]
+
+
 def check_model_access(user_data: dict, model_id: str) -> bool:
     """Проверяет доступ к модели для тарифа пользователя."""
     available = get_available_models(user_data)
@@ -684,7 +726,13 @@ async def ask_nvidia(user_id: int, user_text: str, append_user_message: bool = T
 
     # Получаем модель пользователя
     user_data = await get_user(user_id)
-    model = user_data.get("model", NVIDIA_MODEL)
+    model = pick_model_for_request(user_data, user_text)
+    if user_data.get("model") != model:
+        # не блокируем ответ, если запись не прошла
+        try:
+            await update_user(user_id, {"model": model})
+        except Exception:
+            pass
 
     # Восстанавливаем режим из Firestore (если кэш пуст)
     if user_id not in user_modes:
@@ -967,6 +1015,13 @@ async def cmd_model(message: Message) -> None:
     )
 
 
+@dp.message(Command("auto"))
+async def cmd_auto_model(message: Message) -> None:
+    """Включить авто-выбор модели по задаче."""
+    await update_user(message.from_user.id, {"model_auto": True})
+    await message.answer("✅ Автомодель включена. Я буду выбирать модель под задачу.")
+
+
 @dp.callback_query(F.data.startswith("model:"))
 async def callback_model(call: CallbackQuery) -> None:
     model_id = call.data.split("model:", 1)[1]
@@ -978,7 +1033,7 @@ async def callback_model(call: CallbackQuery) -> None:
         await call.answer(f"❌ Эта модель недоступна на тарифе {TIERS[tier]['name']}", show_alert=True)
         return
     
-    await update_user(call.from_user.id, {"model": model_id})
+    await update_user(call.from_user.id, {"model": model_id, "model_auto": False})
     await log_event(call.from_user.id, "model_changed", {"model": model_id})
     available = get_available_models(user_data)
     label = next((k for k, v in available.items() if v == model_id), model_id)
