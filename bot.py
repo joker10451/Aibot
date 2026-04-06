@@ -185,6 +185,25 @@ PAYWALL_VARIANTS = {
     ),
 }
 
+BUY_SCREEN_VARIANTS = {
+    "A": (
+        f"💸 Разблокируй доступ за {STARS_PRICE} ⭐\n\n"
+        "Что получишь сразу:\n"
+        "— больше сообщений без пауз\n"
+        "— доступ к более мощным моделям\n"
+        "— быстрые ответы для учёбы\n\n"
+        "Нажми кнопку ниже:"
+    ),
+    "B": (
+        f"🚀 Открой доступ за {STARS_PRICE} ⭐\n\n"
+        "Это удобно, если ты учишься каждый день:\n"
+        "— решения по шагам\n"
+        "— проверка ответов\n"
+        "— короткие конспекты\n\n"
+        "Жми кнопку ниже:"
+    ),
+}
+
 SYSTEM_PROMPT = {
     "role": "system",
     "content": (
@@ -494,6 +513,11 @@ async def check_and_reset_limits(user_id: int, user_data: dict) -> dict:
 
 def pick_paywall_variant(user_id: int) -> str:
     """Стабильно выбирает вариант paywall для пользователя (A/B)."""
+    return "A" if (user_id % 2 == 0) else "B"
+
+def pick_buy_variant(user_id: int) -> str:
+    """Стабильно выбирает вариант buy-screen для пользователя (A/B)."""
+    # Можно оставить тот же сплит, чтобы не путать сегментацию
     return "A" if (user_id % 2 == 0) else "B"
 
 
@@ -819,13 +843,11 @@ async def successful_payment(message: Message) -> None:
 
 @dp.message(F.text.lower().in_({"доступ", "купить", "buy", "оплата"}))
 async def buy_access(message: Message) -> None:
+    user_id = message.from_user.id
+    variant = pick_buy_variant(user_id)
+    await log_event(user_id, "buy_screen_shown", {"variant": variant})
     await message.answer(
-        f"💸 Разблокируй доступ за {STARS_PRICE} ⭐\n\n"
-        "Что получишь сразу:\n"
-        "— больше сообщений без пауз\n"
-        "— доступ к более мощным моделям\n"
-        "— быстрые ответы для учёбы\n\n"
-        "Нажми кнопку ниже:",
+        BUY_SCREEN_VARIANTS[variant],
         reply_markup=buy_keyboard(),
     )
 
