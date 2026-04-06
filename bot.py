@@ -1333,14 +1333,15 @@ async def handle_message(message: Message) -> None:
 
     if tier != "pro":
         left_after = int(state.get("left_after", 0) or 0)
+        last_free_used = (left_after == 0)
         if left_after == 1:
             await log_event(user_id, "free_limit_warning", {"tier": tier, "left": 1})
             await message.answer(
                 f"⚠️ Остался 1 бесплатный запрос.\n\n"
                 f"Дальше: Basic {TIERS['basic']['price']} ⭐ или Pro {TIERS['pro']['price']} ⭐."
             )
-        elif left_after == 0:
-            await message.answer("⚠️ Это был последний бесплатный ответ. Готов открыть доступ?")
+    else:
+        last_free_used = False
 
     await bot.send_chat_action(message.chat.id, "typing")
 
@@ -1357,6 +1358,17 @@ async def handle_message(message: Message) -> None:
         parts = split_text(answer)
         for part in parts:
             await message.answer(part)
+
+        # Если это был последний бесплатный ответ — показываем предложение оплаты ПОСЛЕ ответа
+        if last_free_used:
+            await message.answer(
+                "✅ Готово. Это был последний бесплатный ответ.\n\n"
+                f"Продолжить:\n"
+                f"• Basic — {TIERS['basic']['price']} ⭐: 100 сообщений/30 дней\n"
+                f"• Pro — {TIERS['pro']['price']} ⭐: безлимит + все модели\n\n"
+                "Нажми кнопку, чтобы открыть доступ 👇",
+                reply_markup=buy_keyboard(),
+            )
     except Exception as e:
         logger.error(f"Ошибка NVIDIA API: {e}")
         await log_event(user_id, "error_nvidia", {"error": str(e)[:300]})
