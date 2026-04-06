@@ -6,6 +6,8 @@ import os
 import tempfile
 from collections import defaultdict, deque
 import re
+import io
+from typing import Optional
 from openai import OpenAI
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -143,15 +145,13 @@ HOMEWORK_BASE_PROMPT = (
     "— Для математики всегда показывай промежуточные шаги\n"
     "— Избегай длинной воды, пиши кратко и по делу\n"
     "— Одна мысль = один короткий абзац (1–3 строки)\n"
-    "— Если ответ длинный, в конце добавь короткое резюме (3–5 пунктов)\n\n"
-    "Формат ответа (если уместно):\n"
-    "✅ Ответ: ...\n"
-    "🧩 Решение по шагам:\n"
-    "1) ...\n"
-    "2) ...\n"
-    "🧠 Объяснение простыми словами: ...\n"
-    "🔎 Проверка / типичные ошибки: ...\n"
-    "📝 Краткий конспект: ...\n"
+    "— По умолчанию отвечай КОРОТКО: без длинных эссе\n"
+    "— Длинные блоки (типичные ошибки/конспект/очень подробное объяснение) давай только если пользователь попросил\n\n"
+    "Формат ответа по умолчанию:\n"
+    "✅ Ответ: ... (1 строка)\n"
+    "🧩 Шаги: 2–5 коротких пунктов\n"
+    "📝 Итог: 1–2 строки как оформить/что запомнить\n\n"
+    "Если пользователь попросил конкретный формат (пошагово/проще/проверить/конспект) — следуй запросу."
 )
 
 MODES = {
@@ -171,6 +171,7 @@ user_last_request = {}  # {user_id: timestamp} — защита от спама
 user_pending_homework_action = {}  # {user_id: action_instruction}
 user_last_prompt = {}  # {user_id: last_user_text} для /regen
 user_recent_answers = defaultdict(lambda: deque(maxlen=30))  # {user_id: deque[timestamps]} для мини-статов перед paywall
+user_pending_ocr = {}  # {user_id: {"text": str, "conf": float | None, "ts": float}}
 
 PAYWALL_VARIANTS = {
     "A": (
@@ -661,6 +662,19 @@ def buy_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def homework_details_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🧩 Пошагово", callback_data="detail:steps"),
+            InlineKeyboardButton(text="🧠 Проще", callback_data="detail:simple"),
+        ],
+        [
+            InlineKeyboardButton(text="🔎 Ошибки", callback_data="detail:check"),
+            InlineKeyboardButton(text="📝 Конспект", callback_data="detail:summary"),
+        ],
+    ])
+
+
 def models_keyboard(user_data: dict) -> InlineKeyboardMarkup:
     available = get_available_models(user_data)
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -883,6 +897,48 @@ async def callback_buy(call: CallbackQuery) -> None:
         prices=[LabeledPrice(label=f"{tier_name} доступ", amount=price)],
     )
     await call.answer()
+
+
+@dp.callback_query(F.data.startswith("detail:"))
+async def callback_homework_detail(call: CallbackQuery) -> None:
+    user_id = call.from_user.id
+    user_data = await get_user(user_id)
+
+    # считаем как сообщение (потому что это генерация)
+    state = await check_access_and_maybe_increment(user_id)
+    tier = state.get("tier", user_data.get("tier", "free"))
+    if not state.get("allowed", False):
+        variant = pick_paywall_variant(user_id)
+        await log_event(user_id, "paywall_shown", {"tier": tier, "variant": variant})
+        await call.message.answer(PAYWALL_VARIANTS[variant], reply_markup=buy_keyboard())
+        await call.answer()
+        return
+
+    last_prompt = user_last_prompt.get(user_id)
+    if not last_prompt:
+        await call.answer("Сначала отправь задачу текстом.", show_alert=True)
+        return
+
+    kind = (call.data or "").split("detail:", 1)[1].strip()
+    action_map = {
+        "steps": "Сделай решение максимально пошаговым, без пропусков. Покажи промежуточные шаги. Без воды.",
+        "simple": "Объясни очень простыми словами, как для новичка, с аналогией/примером. Коротко.",
+        "check": "Проверь решение и типичные ошибки для этой задачи. Короткий список ошибок и проверка ответа.",
+        "summary": "Сделай очень короткий конспект по теме: 5–7 пунктов.",
+    }
+    action = action_map.get(kind)
+    if not action:
+        await call.answer()
+        return
+
+    await call.answer("Делаю…")
+    await bot.send_chat_action(call.message.chat.id, "typing")
+
+    regen_prompt = f"{last_prompt}\n\nДоп. требование:\n{action}"
+    answer = await ask_nvidia(user_id, regen_prompt, append_user_message=False)
+    answer = format_answer(answer)
+    for part in split_text(answer):
+        await call.message.answer(part)
 
 
 @dp.pre_checkout_query()
@@ -1498,6 +1554,11 @@ async def handle_message(message: Message) -> None:
         parts = split_text(answer)
         for part in parts:
             await message.answer(part)
+
+        # Кнопки "Подробнее" для домашки (чтобы по умолчанию было коротко)
+        current_mode = (user_data.get("mode") or "📚 Домашка")
+        if current_mode == "📚 Домашка":
+            await message.answer("Хочешь подробнее?", reply_markup=homework_details_keyboard())
 
         # Если это был последний бесплатный ответ — показываем предложение оплаты ПОСЛЕ ответа
         if last_free_used:
