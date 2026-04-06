@@ -81,6 +81,18 @@ def _events_ref():
     return db.collection("events")
 
 
+def _feedback_ref():
+    return db.collection("feedback")
+
+
+async def save_feedback(user_id: int, payload: dict) -> None:
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, lambda: _feedback_ref().add(payload))
+    except Exception as e:
+        logger.warning(f"Не удалось записать feedback: {e}")
+
+
 async def log_event(user_id: int | None, event: str, meta: dict | None = None) -> None:
     """Пишем событие в Firestore. Ошибки не должны ломать бота."""
     payload = {
@@ -177,6 +189,7 @@ user_pending_homework_action = {}  # {user_id: action_instruction}
 user_last_prompt = {}  # {user_id: last_user_text} для /regen
 user_recent_answers = defaultdict(lambda: deque(maxlen=30))  # {user_id: deque[timestamps]} для мини-статов перед paywall
 user_pending_ocr = {}  # {user_id: {"text": str, "conf": float | None, "ts": float}}
+user_last_exchange = {}  # {user_id: {"prompt": str, "answer": str, "ts": float, "mode": str, "model": str}}
 
 PAYWALL_VARIANTS = {
     "A": (
@@ -760,6 +773,21 @@ def ocr_confirm_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def feedback_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⭐ 1", callback_data="fb:1"),
+            InlineKeyboardButton(text="⭐ 2", callback_data="fb:2"),
+            InlineKeyboardButton(text="⭐ 3", callback_data="fb:3"),
+            InlineKeyboardButton(text="⭐ 4", callback_data="fb:4"),
+            InlineKeyboardButton(text="⭐ 5", callback_data="fb:5"),
+        ],
+        [
+            InlineKeyboardButton(text="⚠️ Плохо ответил", callback_data="fb:bad"),
+        ],
+    ])
+
+
 def models_keyboard(user_data: dict) -> InlineKeyboardMarkup:
     available = get_available_models(user_data)
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1051,6 +1079,48 @@ async def callback_ocr_confirm(call: CallbackQuery) -> None:
     answer = format_answer(answer)
     for part in split_text(answer):
         await call.message.answer(part)
+
+
+@dp.callback_query(F.data.startswith("fb:"))
+async def callback_feedback(call: CallbackQuery) -> None:
+    user_id = call.from_user.id
+    data = (call.data or "").split("fb:", 1)[1].strip()
+    exchange = user_last_exchange.get(user_id)
+    if not exchange:
+        await call.answer("Нет последнего ответа для оценки.", show_alert=True)
+        return
+
+    import time
+    base = {
+        "user_id": int(user_id),
+        "ts": firestore.SERVER_TIMESTAMP,
+        "client_ts": time.time(),
+        "prompt": exchange.get("prompt", "")[:4000],
+        "answer": exchange.get("answer", "")[:8000],
+        "mode": exchange.get("mode", ""),
+        "model": exchange.get("model", ""),
+        "username": call.from_user.username or "",
+    }
+
+    if data == "bad":
+        base["rating"] = 0
+        base["label"] = "bad"
+        await save_feedback(user_id, base)
+        await log_event(user_id, "feedback_bad", {"mode": base["mode"], "model": base["model"]})
+        await call.answer("Принял. Спасибо — улучшим.", show_alert=True)
+        return
+
+    if data.isdigit():
+        rating = int(data)
+        if 1 <= rating <= 5:
+            base["rating"] = rating
+            base["label"] = "stars"
+            await save_feedback(user_id, base)
+            await log_event(user_id, "feedback_star", {"rating": rating, "mode": base["mode"], "model": base["model"]})
+            await call.answer("Спасибо за оценку!", show_alert=False)
+            return
+
+    await call.answer()
 
 
 @dp.pre_checkout_query()
@@ -1646,8 +1716,17 @@ async def handle_message(message: Message) -> None:
         answer = await ask_nvidia(user_id, message.text)
         answer = format_answer(answer)
 
-        # Запоминаем, что бот реально выдал ответ (для мини-статов paywall)
+        # Сохраняем последнюю связку вопрос→ответ для фидбека
         import time
+        user_last_exchange[user_id] = {
+            "prompt": message.text,
+            "answer": answer,
+            "ts": time.time(),
+            "mode": (user_data.get("mode") or "📚 Домашка"),
+            "model": user_data.get("model", NVIDIA_MODEL),
+        }
+
+        # Запоминаем, что бот реально выдал ответ (для мини-статов paywall)
         user_recent_answers[user_id].append(time.time())
 
         # Добавляем "ценность" (не в каждом сообщении, чтобы не раздражать)
@@ -1666,6 +1745,9 @@ async def handle_message(message: Message) -> None:
         parts = split_text(answer)
         for part in parts:
             await message.answer(part)
+
+        # Фидбек 1–5 / "плохо ответил"
+        await message.answer("Оцени ответ:", reply_markup=feedback_keyboard())
 
         # Кнопки "Подробнее" для домашки (чтобы по умолчанию было коротко)
         current_mode = (user_data.get("mode") or "📚 Домашка")
