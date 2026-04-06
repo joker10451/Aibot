@@ -359,8 +359,28 @@ async def clear_history(user_id: int) -> None:
 
 def format_answer(text: str) -> str:
     """Пост-обработка ответа: убираем markdown, добавляем красивое форматирование."""
-    # Убираем markdown
-    text = text.replace("**", "")
+    # Убираем markdown-символы, которые часто проскакивают из моделей
+    text = (
+        text.replace("**", "")
+        .replace("__", "")
+        .replace("`", "")
+    )
+
+    # Убираем markdown-заголовки и bullets в начале строк
+    cleaned_lines = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            while stripped.startswith("#"):
+                stripped = stripped[1:].lstrip()
+        if stripped.startswith("* "):
+            stripped = "• " + stripped[2:].lstrip()
+        elif stripped.startswith("- "):
+            stripped = "• " + stripped[2:].lstrip()
+        elif stripped == "*":
+            stripped = ""
+        cleaned_lines.append(stripped if line == stripped else (line[: len(line) - len(line.lstrip())] + stripped))
+    text = "\n".join(cleaned_lines)
     
     # Добавляем отступы между блоками (если AI забыл)
     replacements = {
@@ -378,6 +398,8 @@ def format_answer(text: str) -> str:
         if old in text and new.strip() not in text:
             text = text.replace(old, new)
     
+    # Финальная подчистка одиночных звездочек внутри текста
+    text = text.replace("*", "")
     return text.strip()
 
 
