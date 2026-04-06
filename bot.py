@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import tempfile
-from collections import defaultdict
+from collections import defaultdict, deque
 import re
 from openai import OpenAI
 from aiogram import Bot, Dispatcher, F
@@ -170,6 +170,7 @@ user_modes = {}  # {user_id: system_prompt}
 user_last_request = {}  # {user_id: timestamp} — защита от спама
 user_pending_homework_action = {}  # {user_id: action_instruction}
 user_last_prompt = {}  # {user_id: last_user_text} для /regen
+user_recent_answers = defaultdict(lambda: deque(maxlen=30))  # {user_id: deque[timestamps]} для мини-статов перед paywall
 
 PAYWALL_VARIANTS = {
     "A": (
@@ -264,6 +265,9 @@ async def get_user(user_id: int) -> dict:
         "model": NVIDIA_MODEL,
         "username": "",
         "mode": "📚 Домашка",
+        "bonus_messages": 0,
+        "referred_by": None,
+        "referral_rewarded": False,
         "last_reset": datetime.datetime.now(datetime.timezone.utc),
     }
     await loop.run_in_executor(None, lambda: _user_ref(user_id).set(data))
@@ -315,6 +319,7 @@ async def check_access_and_maybe_increment(user_id: int) -> dict:
             tier = data.get("tier", "free")
             limit = TIERS.get(tier, TIERS["free"])["limit"]
             prev_used = int(data.get("messages_used", 0) or 0)
+            bonus = int(data.get("bonus_messages", 0) or 0)
 
             did_reset = False
             if tier in {"basic", "pro"}:
@@ -335,8 +340,10 @@ async def check_access_and_maybe_increment(user_id: int) -> dict:
                     "did_reset": did_reset,
                 }
 
+            effective_limit = limit + max(0, bonus)
+
             # Если лимит исчерпан — не инкрементим
-            if prev_used >= limit:
+            if prev_used >= effective_limit:
                 return {
                     "allowed": False,
                     "tier": tier,
@@ -348,7 +355,7 @@ async def check_access_and_maybe_increment(user_id: int) -> dict:
 
             new_used = prev_used + 1
             transaction_obj.update(user_ref, {"messages_used": new_used})
-            left_after = max(0, limit - new_used)
+            left_after = max(0, effective_limit - new_used)
 
             return {
                 "allowed": True,
@@ -525,7 +532,9 @@ def remaining_from(user_data: dict) -> int:
     limit = TIERS[tier]["limit"]
     if limit == -1:  # безлимит
         return 999
-    return max(0, limit - user_data.get("messages_used", 0))
+    bonus = int(user_data.get("bonus_messages", 0) or 0)
+    effective_limit = limit + max(0, bonus)
+    return max(0, effective_limit - user_data.get("messages_used", 0))
 
 
 def get_available_models(user_data: dict) -> dict[str, str]:
@@ -668,6 +677,7 @@ def get_main_menu() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🔎 Проверь ответ"), KeyboardButton(text="📝 Краткий конспект")],
         [KeyboardButton(text="🔄 Перегенерировать")],
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🧹 Очистить")],
+        [KeyboardButton(text="📤 Поделиться ботом")],
     ])
     return kb
 
@@ -677,6 +687,7 @@ def get_quick_start_menu() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(resize_keyboard=True, keyboard=[
         [KeyboardButton(text="✍️ Написать текст"), KeyboardButton(text="📚 Сделать домашку")],
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🧹 Очистить")],
+        [KeyboardButton(text="📤 Поделиться ботом")],
     ])
     return kb
 
@@ -689,6 +700,18 @@ dp  = Dispatcher(storage=MemoryStorage())
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     user_id   = message.from_user.id
+    # парсим referral payload: /start ref_<referrer_id>
+    payload = ""
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2:
+        payload = parts[1].strip()
+
+    referrer_id = None
+    if payload.startswith("ref_"):
+        raw = payload[4:].strip()
+        if raw.isdigit():
+            referrer_id = int(raw)
+
     user_data = await get_user(user_id)
     user_data = await check_and_reset_limits(user_id, user_data)
 
@@ -697,6 +720,12 @@ async def cmd_start(message: Message) -> None:
     # Сохраняем username при первом старте
     if not user_data.get("username"):
         await update_user(user_id, {"username": message.from_user.username or ""})
+
+    # Сохраняем, кто пригласил (только 1 раз, без self-ref)
+    if referrer_id and referrer_id != user_id and not user_data.get("referred_by"):
+        await update_user(user_id, {"referred_by": referrer_id})
+        await log_event(user_id, "referral_link_opened", {"referrer_id": referrer_id})
+        user_data["referred_by"] = referrer_id
 
     tier = user_data.get("tier", "free")
     tier_name = TIERS[tier]["name"]
@@ -709,23 +738,16 @@ async def cmd_start(message: Message) -> None:
         access_line = f"🆓 Бесплатно: {left} сообщений"
 
     await message.answer(
-        "📚 AskNeuro AI — помощник по учёбе\n\n"
+        "🤖 Бот, который помогает с домашкой\n\n"
         f"{access_line}\n"
         f"📦 Текущий тариф: {tier_name}\n\n"
-        "Скинь задачу/тему — я:\n"
-        "✅ решу и объясню по шагам\n"
-        "🧠 объясню простыми словами\n"
-        "🔎 проверю твой ответ и найду ошибки\n"
-        "📝 сделаю короткий конспект\n\n"
-        "⚡ Как пользоваться за 10 секунд:\n"
-        "1) Нажми «📚 Сделать домашку» или просто напиши задачу\n"
-        "2) При необходимости выбери «🧩 Пошагово» / «🧠 Объясни проще»\n"
-        "3) Получи готовое решение и разбор\n\n"
-        "Примеры:\n"
-        "— «Реши: x² + 5x + 6 = 0»\n"
-        "— «Объясни фотосинтез простыми словами»\n"
-        "— «Проверь моё решение: ...»\n\n"
-        "Выбери сценарий ниже или отправь задачу сразу:",
+        "Скинь задачу — получишь:\n"
+        "✅ готовое решение\n"
+        "🧠 объяснение простыми словами\n"
+        "🔎 проверку ошибок (если пришлёшь свой ответ)\n\n"
+        "⚡ Попробуй прямо сейчас:\n"
+        "«Реши x² + 5x + 6 = 0»\n\n"
+        "Выбери сценарий ниже или отправь задачу сразу 👇",
         reply_markup=get_quick_start_menu(),
     )
 
@@ -747,7 +769,22 @@ async def cmd_help(message: Message) -> None:
         "/start — быстрый старт\n"
         "/status — лимит и тариф\n"
         "/model — выбор модели\n"
-        "/clear — очистить историю"
+        "/clear — очистить историю\n"
+        "/ref — реферальная ссылка"
+    )
+
+
+@dp.message(Command("ref"))
+async def cmd_ref(message: Message) -> None:
+    """Реферальная ссылка: пригласи друга и получи +5 сообщений."""
+    me = await bot.get_me()
+    user_id = message.from_user.id
+    link = f"https://t.me/{me.username}?start=ref_{user_id}"
+    await message.answer(
+        "🎁 Рефералка: приведи друга — получишь +5 сообщений.\n\n"
+        f"Твоя ссылка:\n{link}\n\n"
+        "Условие: друг должен перейти по ссылке и отправить хотя бы 1 запрос.",
+        reply_markup=get_main_menu(),
     )
 
 
@@ -1034,6 +1071,19 @@ async def menu_clear(message: Message) -> None:
     """Кнопка Очистить из меню."""
     await clear_history(message.from_user.id)
     await message.answer("🗑 История очищена.", reply_markup=get_main_menu())
+
+
+@dp.message(F.text == "📤 Поделиться ботом")
+async def menu_share(message: Message) -> None:
+    """Кнопка Поделиться ботом из меню."""
+    me = await bot.get_me()
+    user_id = message.from_user.id
+    await message.answer(
+        "🚀 Вот бот, который помогает с домашкой:\n"
+        f"https://t.me/{me.username}?start=ref_{user_id}\n\n"
+        "Если помогло — скинь другу 👇",
+        reply_markup=get_main_menu(),
+    )
 
 
 @dp.message(Command("grant"))
@@ -1340,8 +1390,29 @@ async def handle_message(message: Message) -> None:
     if not state.get("allowed", False):
         variant = pick_paywall_variant(user_id)
         await log_event(user_id, "paywall_shown", {"tier": tier, "variant": variant})
+
+        # Мини-"вау" перед оплатой: что уже успели сделать за последние минуты
+        import time
+        now = time.time()
+        dq = user_recent_answers.get(user_id)
+        if dq:
+            while dq and (now - dq[0]) > 120:
+                dq.popleft()
+        solved = len(dq) if dq else 0
+        if solved >= 3:
+            saved = solved * 10
+            extra = (
+                "\n\n🔥 Ты используешь бота как профи.\n"
+                f"За последние 2 минуты:\n"
+                f"— решено задач: {solved}\n"
+                f"— сэкономлено времени: ~{saved} мин\n\n"
+                "Хочешь продолжить без ограничений?"
+            )
+        else:
+            extra = ""
+
         await message.answer(
-            PAYWALL_VARIANTS[variant],
+            PAYWALL_VARIANTS[variant] + extra,
             reply_markup=buy_keyboard(),
         )
         return
@@ -1366,9 +1437,58 @@ async def handle_message(message: Message) -> None:
     await bot.send_chat_action(message.chat.id, "typing")
 
     try:
+        # Начисляем реф-бонус рефереру после первого реального запроса приглашённого
+        # (один раз, без self-ref, без повторов)
+        if int(state.get("prev_used", 0) or 0) == 0 and user_data.get("referred_by") and not user_data.get("referral_rewarded"):
+            referrer_id = int(user_data.get("referred_by"))
+            if referrer_id and referrer_id != user_id:
+                def _reward_tx():
+                    transaction = db.transaction()
+                    referred_ref = _user_ref(user_id)
+                    referrer_ref = _user_ref(referrer_id)
+
+                    @firestore.transactional
+                    def _run(transaction_obj):
+                        referred_snap = referred_ref.get(transaction=transaction_obj)
+                        referred_data = referred_snap.to_dict() or {}
+                        if referred_data.get("referral_rewarded"):
+                            return False
+                        if int(referred_data.get("referred_by") or 0) != referrer_id:
+                            return False
+
+                        ref_snap = referrer_ref.get(transaction=transaction_obj)
+                        ref_data = ref_snap.to_dict() or {}
+                        current_bonus = int(ref_data.get("bonus_messages", 0) or 0)
+                        transaction_obj.update(referrer_ref, {"bonus_messages": current_bonus + 5})
+                        transaction_obj.update(referred_ref, {"referral_rewarded": True})
+                        return True
+
+                    return _run(transaction)
+
+                loop = asyncio.get_event_loop()
+                rewarded = await loop.run_in_executor(None, _reward_tx)
+                if rewarded:
+                    await log_event(user_id, "referral_rewarded", {"referrer_id": referrer_id, "bonus": 5})
+                    try:
+                        await bot.send_message(referrer_id, "🎁 Бонус: +5 сообщений за друга! Спасибо 🙌")
+                    except Exception:
+                        pass
+
         user_last_prompt[user_id] = message.text
         answer = await ask_nvidia(user_id, message.text)
         answer = format_answer(answer)
+
+        # Запоминаем, что бот реально выдал ответ (для мини-статов paywall)
+        import time
+        user_recent_answers[user_id].append(time.time())
+
+        # Добавляем "ценность" (не в каждом сообщении, чтобы не раздражать)
+        current_mode = (user_data.get("mode") or "📚 Домашка")
+        if current_mode == "📚 Домашка" and int(state.get("prev_used", 0) or 0) % 2 == 0:
+            answer += (
+                "\n\n📌 Это типовая задача — такие часто бывают на зачётах/экзаменах.\n"
+                "💾 Сохрани решение — пригодится перед контрольной."
+            )
         
         # Добавляем микро-продажу в конец
         if tier != "pro":
