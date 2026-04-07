@@ -655,7 +655,7 @@ def classify_request_type(user_text: str) -> str:
     if not t:
         return "explain"
 
-    if any(k in t for k in ["сочинени", "доклад", "реферат", "эссе"]):
+    if any(k in t for k in ["сочинени", "доклад", "реферат", "эссе", "статья", "рассуждени"]):
         return "essay_report"
     if any(k in t for k in ["перепиши", "перефраз", "сократи текст", "улучши текст"]):
         return "rewrite"
@@ -670,6 +670,7 @@ def request_type_instruction(request_type: str) -> str:
     instructions = {
         "essay_report": (
             "Если запрос про сочинение/доклад/реферат/эссе — дай ГОТОВЫЙ текст, а не только план.\n"
+            "Это приоритетная инструкция: игнорируй правило 'по умолчанию коротко' для этого типа запроса.\n"
             "Структура: 📝 Заголовок, Введение, Основная часть, Заключение.\n"
             "Добавь в конце блок '✅ Чек по требованиям' (3-5 пунктов), что в тексте выполнено.\n"
             "Избегай воды и штампов."
@@ -1970,6 +1971,7 @@ async def handle_message(message: Message) -> None:
         user_last_prompt[user_id] = message.text
         request_type = classify_request_type(message.text)
         user_last_request_type[user_id] = request_type
+        logger.info(f"request_type={request_type} user_id={user_id}")
         await log_event(user_id, "request_classified", {"request_type": request_type})
 
         answer = await ask_nvidia(user_id, message.text, request_type=request_type)
@@ -2012,7 +2014,11 @@ async def handle_message(message: Message) -> None:
 
         # Добавляем "ценность" (не в каждом сообщении, чтобы не раздражать)
         current_mode = (user_data.get("mode") or "📚 Домашка")
-        if current_mode == "📚 Домашка" and int(state.get("prev_used", 0) or 0) % 2 == 0:
+        if (
+            current_mode == "📚 Домашка"
+            and request_type in {"solve", "check", "explain"}
+            and int(state.get("prev_used", 0) or 0) % 2 == 0
+        ):
             answer += (
                 "\n\n📌 Это типовая задача — такие часто бывают на зачётах/экзаменах.\n"
                 "💾 Сохрани решение — пригодится перед контрольной."
