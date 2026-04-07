@@ -192,6 +192,7 @@ user_last_prompt = {}  # {user_id: last_user_text} для /regen
 user_recent_answers = defaultdict(lambda: deque(maxlen=30))  # {user_id: deque[timestamps]} для мини-статов перед paywall
 user_pending_ocr = {}  # {user_id: {"text": str, "conf": float | None, "ts": float}}
 user_last_exchange = {}  # {user_id: {"prompt": str, "answer": str, "ts": float, "mode": str, "model": str}}
+user_last_request_type = {}  # {user_id: request_type}
 
 PAYWALL_VARIANTS = {
     "A": (
@@ -530,7 +531,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 
 # ─── Вспомогательные функции ─────────────────────────────────────────────────
 
-def format_answer(text: str) -> str:
+def format_answer(text: str, request_type: str = "explain") -> str:
     """Пост-обработка ответа: убираем markdown, добавляем красивое форматирование."""
     # Убираем markdown-символы, которые часто проскакивают из моделей
     text = (
@@ -601,9 +602,10 @@ def format_answer(text: str) -> str:
 
     # 4) Если текст всё равно выглядит монолитом, добавим мягкую разбивку после предложений в больших абзацах
     #    (только если в строке > 220 символов и нет явных переносов)
+    long_line_limit = 170 if request_type == "essay_report" else 220
     wrapped_lines = []
     for line in text.splitlines():
-        if len(line) > 220 and "•" not in line and not re.search(r"\d\)", line):
+        if len(line) > long_line_limit and "•" not in line and not re.search(r"\d\)", line):
             # попробуем вставить перенос после ближайшей точки/двоеточия
             parts = re.split(r"(?<=[\.:;])\s+", line)
             buf = ""
@@ -646,6 +648,114 @@ def split_text(text: str, max_length: int = 4000) -> list[str]:
         text = text[split_pos:].lstrip()
     
     return parts
+
+
+def classify_request_type(user_text: str) -> str:
+    t = (user_text or "").lower().strip()
+    if not t:
+        return "explain"
+
+    if any(k in t for k in ["сочинени", "доклад", "реферат", "эссе"]):
+        return "essay_report"
+    if any(k in t for k in ["перепиши", "перефраз", "сократи текст", "улучши текст"]):
+        return "rewrite"
+    if any(k in t for k in ["проверь", "проверка", "найди ошибки", "исправь ошибки"]):
+        return "check"
+    if any(k in t for k in ["реши", "вычисли", "найди", "уравнени", "система", "интеграл", "производн"]):
+        return "solve"
+    return "explain"
+
+
+def request_type_instruction(request_type: str) -> str:
+    instructions = {
+        "essay_report": (
+            "Если запрос про сочинение/доклад/реферат/эссе — дай ГОТОВЫЙ текст, а не только план.\n"
+            "Структура: 📝 Заголовок, Введение, Основная часть, Заключение.\n"
+            "Добавь в конце блок '✅ Чек по требованиям' (3-5 пунктов), что в тексте выполнено.\n"
+            "Избегай воды и штампов."
+        ),
+        "rewrite": (
+            "Если просят переписать/улучшить текст: сначала дай улучшенный вариант, "
+            "потом коротко перечисли 3-5 внесенных улучшений."
+        ),
+        "check": (
+            "Если просят проверить: структура ответа должна быть '🔎 Ошибки' -> "
+            "'✅ Исправленный вариант' -> '📝 Что запомнить'."
+        ),
+        "solve": (
+            "Если задача вычислительная: обязательно промежуточные шаги и короткая проверка результата."
+        ),
+        "explain": (
+            "Если это объяснение темы: коротко, с 1-2 простыми примерами."
+        ),
+    }
+    return instructions.get(request_type, instructions["explain"])
+
+
+def essay_details_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✂️ Сделать короче", callback_data="detail:essay_shorter"),
+            InlineKeyboardButton(text="🎓 Официальнее", callback_data="detail:essay_formal"),
+        ],
+        [
+            InlineKeyboardButton(text="➕ Добавить аргументы", callback_data="detail:essay_args"),
+            InlineKeyboardButton(text="🗂 План по тексту", callback_data="detail:essay_plan"),
+        ],
+    ])
+
+
+def is_essay_quality_ok(answer: str) -> bool:
+    t = (answer or "").lower()
+    has_intro = ("введение" in t)
+    has_body = ("основная часть" in t) or ("основной части" in t)
+    has_outro = ("заключение" in t) or ("вывод" in t)
+    return has_intro and has_body and has_outro
+
+
+def build_quality_fix_prompt(original_prompt: str, draft_answer: str, request_type: str) -> str:
+    if request_type == "essay_report":
+        return (
+            "Исправь черновик и верни финальную версию.\n"
+            "Требования: это должен быть готовый текст, не план. Обязательно разделы: "
+            "Введение, Основная часть, Заключение. В конце добавь '✅ Чек по требованиям' (3-5 пунктов).\n\n"
+            f"Исходный запрос:\n{original_prompt}\n\n"
+            f"Черновик:\n{draft_answer}"
+        )
+    return (
+        "Улучши ответ: сделай его более структурным, полезным и кратким без потери смысла.\n\n"
+        f"Исходный запрос:\n{original_prompt}\n\n"
+        f"Черновик:\n{draft_answer}"
+    )
+
+
+def solve_format_requires_digits(user_text: str) -> bool:
+    t = (user_text or "").lower()
+    triggers = [
+        "последовательность цифр",
+        "в ответе запиши",
+        "соответствие",
+        "обозначены цифрами",
+        "установите соответствие",
+    ]
+    return any(k in t for k in triggers)
+
+
+def is_solve_quality_ok(user_text: str, answer: str) -> bool:
+    if not solve_format_requires_digits(user_text):
+        return True
+    # Ожидаем короткий финальный код вида 4312 / 1234 и т.п.
+    return bool(re.search(r"(ответ|итог)\s*[:\-]?\s*\d{3,8}\b", (answer or "").lower()))
+
+
+def build_solve_fix_prompt(original_prompt: str, draft_answer: str) -> str:
+    return (
+        "Исправь решение и верни финальный ответ в требуемом формате задачи.\n"
+        "Если в условии просят последовательность цифр/соответствие, в конце обязательно дай строку:\n"
+        "✅ Ответ: <только последовательность цифр без лишнего текста>\n\n"
+        f"Исходный запрос:\n{original_prompt}\n\n"
+        f"Черновик:\n{draft_answer}"
+    )
 
 
 def remaining_from(user_data: dict) -> int:
@@ -745,7 +855,12 @@ def pick_buy_variant(user_id: int) -> str:
     return "A" if (user_id % 2 == 0) else "B"
 
 
-async def ask_nvidia(user_id: int, user_text: str, append_user_message: bool = True) -> str:
+async def ask_nvidia(
+    user_id: int,
+    user_text: str,
+    append_user_message: bool = True,
+    request_type: Optional[str] = None,
+) -> str:
     """Запрос к NVIDIA NIM API с историей из Firestore."""
     # Сохраняем сообщение пользователя (для обычных запросов)
     if append_user_message:
@@ -775,14 +890,19 @@ async def ask_nvidia(user_id: int, user_text: str, append_user_message: bool = T
     if not base_prompt:
         base_prompt = SYSTEM_PROMPT["content"]
 
+    req_type = request_type or classify_request_type(user_text)
     action = user_pending_homework_action.pop(user_id, None)
+    type_instruction = request_type_instruction(req_type)
     if action:
         system_prompt = {
             "role": "system",
-            "content": f"{base_prompt}\n\nДоп. требование:\n{action}",
+            "content": f"{base_prompt}\n\nТип запроса: {req_type}\n\nИнструкция по типу:\n{type_instruction}\n\nДоп. требование:\n{action}",
         }
     else:
-        system_prompt = {"role": "system", "content": base_prompt}
+        system_prompt = {
+            "role": "system",
+            "content": f"{base_prompt}\n\nТип запроса: {req_type}\n\nИнструкция по типу:\n{type_instruction}",
+        }
 
     loop = asyncio.get_event_loop()
     # Мягкий retry на временные сбои API
@@ -1142,12 +1262,24 @@ async def callback_homework_detail(call: CallbackQuery) -> None:
         return
 
     kind = (call.data or "").split("detail:", 1)[1].strip()
-    action_map = {
+    request_type = (
+        user_last_exchange.get(user_id, {}).get("request_type")
+        or user_last_request_type.get(user_id)
+        or classify_request_type(last_prompt)
+    )
+    default_action_map = {
         "steps": "Сделай решение максимально пошаговым, без пропусков. Покажи промежуточные шаги. Без воды.",
         "simple": "Объясни очень простыми словами, как для новичка, с аналогией/примером. Коротко.",
         "check": "Проверь решение и типичные ошибки для этой задачи. Короткий список ошибок и проверка ответа.",
         "summary": "Сделай очень короткий конспект по теме: 5–7 пунктов.",
     }
+    essay_action_map = {
+        "essay_shorter": "Перепиши этот текст в более коротком виде, сохранив ключевые аргументы.",
+        "essay_formal": "Сделай стиль более официальным, как для школьной/вузовской сдачи.",
+        "essay_args": "Добавь 2-3 сильных аргумента и улучши связки между абзацами.",
+        "essay_plan": "На основе готового текста составь краткий план (5-7 пунктов).",
+    }
+    action_map = essay_action_map if request_type == "essay_report" else default_action_map
     action = action_map.get(kind)
     if not action:
         await call.answer()
@@ -1157,8 +1289,13 @@ async def callback_homework_detail(call: CallbackQuery) -> None:
     await bot.send_chat_action(call.message.chat.id, "typing")
 
     regen_prompt = f"{last_prompt}\n\nДоп. требование:\n{action}"
-    answer = await ask_nvidia(user_id, regen_prompt, append_user_message=False)
-    answer = format_answer(answer)
+    answer = await ask_nvidia(
+        user_id,
+        regen_prompt,
+        append_user_message=False,
+        request_type=request_type,
+    )
+    answer = format_answer(answer, request_type=request_type)
     for part in split_text(answer):
         await call.message.answer(part)
 
@@ -1183,8 +1320,10 @@ async def callback_ocr_confirm(call: CallbackQuery) -> None:
     await call.answer("Делаю…")
     await bot.send_chat_action(call.message.chat.id, "typing")
 
-    answer = await ask_nvidia(user_id, text)
-    answer = format_answer(answer)
+    request_type = classify_request_type(text)
+    user_last_request_type[user_id] = request_type
+    answer = await ask_nvidia(user_id, text, request_type=request_type)
+    answer = format_answer(answer, request_type=request_type)
     for part in split_text(answer):
         await call.message.answer(part)
 
@@ -1337,8 +1476,14 @@ async def handle_regen(message: Message, user_id: int, last_prompt: str) -> None
         f"Сделай альтернативный вариант ответа на этот запрос.\n\nЗапрос пользователя:\n{last_prompt}"
     )
     try:
-        answer = await ask_nvidia(user_id, regen_prompt, append_user_message=False)
-        answer = format_answer(answer)
+        request_type = user_last_request_type.get(user_id) or classify_request_type(last_prompt)
+        answer = await ask_nvidia(
+            user_id,
+            regen_prompt,
+            append_user_message=False,
+            request_type=request_type,
+        )
+        answer = format_answer(answer, request_type=request_type)
         await message.answer(answer)
     except Exception as e:
         logger.error(f"Ошибка regenerate: {e}")
@@ -1823,8 +1968,33 @@ async def handle_message(message: Message) -> None:
                         pass
 
         user_last_prompt[user_id] = message.text
-        answer = await ask_nvidia(user_id, message.text)
-        answer = format_answer(answer)
+        request_type = classify_request_type(message.text)
+        user_last_request_type[user_id] = request_type
+        await log_event(user_id, "request_classified", {"request_type": request_type})
+
+        answer = await ask_nvidia(user_id, message.text, request_type=request_type)
+        answer = format_answer(answer, request_type=request_type)
+
+        if request_type == "essay_report" and not is_essay_quality_ok(answer):
+            fix_prompt = build_quality_fix_prompt(message.text, answer, request_type)
+            fixed_answer = await ask_nvidia(
+                user_id,
+                fix_prompt,
+                append_user_message=False,
+                request_type=request_type,
+            )
+            answer = format_answer(fixed_answer, request_type=request_type)
+            await log_event(user_id, "quality_autofix_applied", {"request_type": request_type})
+        elif request_type == "solve" and not is_solve_quality_ok(message.text, answer):
+            fix_prompt = build_solve_fix_prompt(message.text, answer)
+            fixed_answer = await ask_nvidia(
+                user_id,
+                fix_prompt,
+                append_user_message=False,
+                request_type=request_type,
+            )
+            answer = format_answer(fixed_answer, request_type=request_type)
+            await log_event(user_id, "quality_autofix_applied", {"request_type": "solve"})
 
         # Сохраняем последнюю связку вопрос→ответ для фидбека
         import time
@@ -1834,6 +2004,7 @@ async def handle_message(message: Message) -> None:
             "ts": time.time(),
             "mode": (user_data.get("mode") or "📚 Домашка"),
             "model": user_data.get("model", NVIDIA_MODEL),
+            "request_type": request_type,
         }
 
         # Запоминаем, что бот реально выдал ответ (для мини-статов paywall)
@@ -1862,7 +2033,8 @@ async def handle_message(message: Message) -> None:
         # Кнопки "Подробнее" для домашки (чтобы по умолчанию было коротко)
         current_mode = (user_data.get("mode") or "📚 Домашка")
         if current_mode == "📚 Домашка":
-            await message.answer("Хочешь подробнее?", reply_markup=homework_details_keyboard())
+            detail_kb = essay_details_keyboard() if request_type == "essay_report" else homework_details_keyboard()
+            await message.answer("Хочешь подробнее?", reply_markup=detail_kb)
 
         # Если это был последний бесплатный ответ — показываем предложение оплаты ПОСЛЕ ответа
         if last_free_used:
@@ -1944,8 +2116,10 @@ async def handle_photo(message: Message) -> None:
     else:
         # auto-confirm
         user_last_prompt[user_id] = text
-        answer = await ask_nvidia(user_id, text)
-        answer = format_answer(answer)
+        request_type = classify_request_type(text)
+        user_last_request_type[user_id] = request_type
+        answer = await ask_nvidia(user_id, text, request_type=request_type)
+        answer = format_answer(answer, request_type=request_type)
         for part in split_text(answer):
             await message.answer(part)
 
@@ -1983,8 +2157,10 @@ async def handle_document(message: Message) -> None:
             await message.answer("⚠️ Не смог прочитать текст из .txt. Попробуй другой файл.")
             return
         user_last_prompt[user_id] = text
-        answer = await ask_nvidia(user_id, text)
-        answer = format_answer(answer)
+        request_type = classify_request_type(text)
+        user_last_request_type[user_id] = request_type
+        answer = await ask_nvidia(user_id, text, request_type=request_type)
+        answer = format_answer(answer, request_type=request_type)
         for part in split_text(answer):
             await message.answer(part)
         return
@@ -2001,8 +2177,10 @@ async def handle_document(message: Message) -> None:
 
         if text and len(text) >= 25:
             user_last_prompt[user_id] = text
-            answer = await ask_nvidia(user_id, text)
-            answer = format_answer(answer)
+            request_type = classify_request_type(text)
+            user_last_request_type[user_id] = request_type
+            answer = await ask_nvidia(user_id, text, request_type=request_type)
+            answer = format_answer(answer, request_type=request_type)
             for part in split_text(answer):
                 await message.answer(part)
             return
@@ -2043,8 +2221,10 @@ async def handle_document(message: Message) -> None:
             )
         else:
             user_last_prompt[user_id] = text
-            answer = await ask_nvidia(user_id, text)
-            answer = format_answer(answer)
+            request_type = classify_request_type(text)
+            user_last_request_type[user_id] = request_type
+            answer = await ask_nvidia(user_id, text, request_type=request_type)
+            answer = format_answer(answer, request_type=request_type)
             for part in split_text(answer):
                 await message.answer(part)
         return
