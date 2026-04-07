@@ -684,7 +684,8 @@ def request_type_instruction(request_type: str) -> str:
             "'✅ Исправленный вариант' -> '📝 Что запомнить'."
         ),
         "solve": (
-            "Если задача вычислительная: обязательно промежуточные шаги и короткая проверка результата."
+            "Если задача вычислительная: обязательно промежуточные шаги и короткая проверка результата.\n"
+            "Если это задача на соответствие (пункты/цифры), финальный ответ обязан быть последовательностью цифр."
         ),
         "explain": (
             "Если это объяснение темы: коротко, с 1-2 простыми примерами."
@@ -742,18 +743,31 @@ def solve_format_requires_digits(user_text: str) -> bool:
     return any(k in t for k in triggers)
 
 
+def is_mapping_digits_task(user_text: str) -> bool:
+    t = (user_text or "").lower()
+    has_mapping_words = any(k in t for k in ["соответствие", "обозначены цифрами", "последовательность цифр"])
+    has_place_words = any(k in t for k in ["населенные пункты", "населённые пункты", "деревн", "станци", "пункт"])
+    has_direction_noise = any(k in t for k in ["налево", "направо", "поворот", "маршрут"])
+    return (has_mapping_words or has_place_words) and has_direction_noise
+
+
 def is_solve_quality_ok(user_text: str, answer: str) -> bool:
-    if not solve_format_requires_digits(user_text):
+    if not (solve_format_requires_digits(user_text) or is_mapping_digits_task(user_text)):
         return True
     # Ожидаем короткий финальный код вида 4312 / 1234 и т.п.
-    return bool(re.search(r"(ответ|итог)\s*[:\-]?\s*\d{3,8}\b", (answer or "").lower()))
+    a = (answer or "").lower()
+    has_digits = bool(re.search(r"(ответ|итог)\s*[:\-]?\s*\d{3,8}\b", a))
+    # Для задач на соответствие считаем некачественным ответ с "налево/направо" вместо кода.
+    has_wrong_style = any(k in a for k in ["налево", "направо", "повернуть", "маршрут"])
+    return has_digits and not has_wrong_style
 
 
 def build_solve_fix_prompt(original_prompt: str, draft_answer: str) -> str:
     return (
         "Исправь решение и верни финальный ответ в требуемом формате задачи.\n"
         "Если в условии просят последовательность цифр/соответствие, в конце обязательно дай строку:\n"
-        "✅ Ответ: <только последовательность цифр без лишнего текста>\n\n"
+        "✅ Ответ: <только последовательность цифр без лишнего текста>\n"
+        "Не пиши про повороты налево/направо, если вопрос про соответствие пунктов и цифр.\n\n"
         f"Исходный запрос:\n{original_prompt}\n\n"
         f"Черновик:\n{draft_answer}"
     )
