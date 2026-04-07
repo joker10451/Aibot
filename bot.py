@@ -687,15 +687,15 @@ def pick_model_for_request(user_data: dict, user_text: str) -> str:
     preferred = []
     if is_math or is_code or long:
         preferred = [
-            "z-ai/glm4_7",
             "meta/llama-3.1-70b-instruct",
             "mistralai/mistral-7b-instruct-v0.3",
+            "z-ai/glm4_7",
         ]
     else:
         preferred = [
-            "z-ai/glm4_7",
             "mistralai/mistral-7b-instruct-v0.3",
             "meta/llama-3.1-70b-instruct",
+            "z-ai/glm4_7",
         ]
 
     for mid in preferred:
@@ -803,14 +803,26 @@ async def ask_nvidia(user_id: int, user_text: str, append_user_message: bool = T
         except Exception as e:
             last_error = e
             # Частый кейс: конкретная модель недоступна на endpoint (404).
-            # Фолбэк на стабильную модель, чтобы не ронять ответ пользователю.
-            if "404" in str(e) and model != "z-ai/glm4_7":
-                model = "z-ai/glm4_7"
-                try:
-                    await update_user(user_id, {"model": model, "model_auto": True})
-                except Exception:
-                    pass
-                continue
+            # Перебираем рабочие fallback-модели из доступных на тарифе.
+            if "404" in str(e):
+                available = list(get_available_models(user_data).values())
+                fallback_candidates = [
+                    "meta/llama-3.1-70b-instruct",
+                    "mistralai/mistral-7b-instruct-v0.3",
+                    "z-ai/glm4_7",
+                ]
+                switched = False
+                for candidate in fallback_candidates:
+                    if candidate in available and candidate != model:
+                        model = candidate
+                        switched = True
+                        try:
+                            await update_user(user_id, {"model": model, "model_auto": True})
+                        except Exception:
+                            pass
+                        break
+                if switched:
+                    continue
             if attempt == 0:
                 await asyncio.sleep(1.2)
             else:
