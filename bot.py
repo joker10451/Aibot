@@ -756,7 +756,13 @@ def is_mapping_digits_task(user_text: str) -> bool:
     has_mapping_words = any(k in t for k in ["соответствие", "обозначены цифрами", "последовательность цифр"])
     has_place_words = any(k in t for k in ["населенные пункты", "населённые пункты", "деревн", "станци", "пункт"])
     has_direction_noise = any(k in t for k in ["налево", "направо", "поворот", "маршрут"])
-    return (has_mapping_words or has_place_words) and has_direction_noise
+    # Частый OCR-кейс этой задачи: названия пунктов распознаны, а слово
+    # "последовательность" может быть с ошибками.
+    known_places = ["дымов", "ковылкин", "лесн", "путятин"]
+    places_hits = sum(1 for p in known_places if p in t)
+    has_sequence_hint = any(k in t for k in ["последоват", "цифр", "обознач"])
+    looks_like_mapping_ocr = places_hits >= 2 and has_sequence_hint
+    return ((has_mapping_words or has_place_words) and has_direction_noise) or looks_like_mapping_ocr
 
 
 def is_solve_quality_ok(user_text: str, answer: str) -> bool:
