@@ -688,11 +688,14 @@ def pick_model_for_request(user_data: dict, user_text: str) -> str:
     if is_math or is_code or long:
         preferred = [
             "z-ai/glm4_7",
-            "minimaxai/minimax-m2_1",
+            "meta/llama-3.1-70b-instruct",
+            "mistralai/mistral-7b-instruct-v0.3",
         ]
     else:
         preferred = [
             "z-ai/glm4_7",
+            "mistralai/mistral-7b-instruct-v0.3",
+            "meta/llama-3.1-70b-instruct",
         ]
 
     for mid in preferred:
