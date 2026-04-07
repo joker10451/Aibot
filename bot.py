@@ -655,6 +655,8 @@ def classify_request_type(user_text: str) -> str:
     if not t:
         return "explain"
 
+    if is_mapping_digits_task(user_text):
+        return "solve"
     if any(k in t for k in ["сочинени", "доклад", "реферат", "эссе", "статья", "рассуждени"]):
         return "essay_report"
     if any(k in t for k in ["перепиши", "перефраз", "сократи текст", "улучши текст"]):
@@ -664,6 +666,12 @@ def classify_request_type(user_text: str) -> str:
     if any(k in t for k in ["реши", "вычисли", "найди", "уравнени", "система", "интеграл", "производн"]):
         return "solve"
     return "explain"
+
+
+def normalize_request_type(user_text: str, request_type: str) -> str:
+    if is_mapping_digits_task(user_text):
+        return "solve"
+    return request_type
 
 
 def request_type_instruction(request_type: str) -> str:
@@ -1345,7 +1353,7 @@ async def callback_ocr_confirm(call: CallbackQuery) -> None:
     await call.answer("Делаю…")
     await bot.send_chat_action(call.message.chat.id, "typing")
 
-    request_type = classify_request_type(text)
+    request_type = normalize_request_type(text, classify_request_type(text))
     user_last_request_type[user_id] = request_type
     answer = await ask_nvidia(user_id, text, request_type=request_type)
     answer = format_answer(answer, request_type=request_type)
@@ -1993,7 +2001,7 @@ async def handle_message(message: Message) -> None:
                         pass
 
         user_last_prompt[user_id] = message.text
-        request_type = classify_request_type(message.text)
+        request_type = normalize_request_type(message.text, classify_request_type(message.text))
         user_last_request_type[user_id] = request_type
         logger.info(f"request_type={request_type} user_id={user_id}")
         await log_event(user_id, "request_classified", {"request_type": request_type})
@@ -2011,7 +2019,7 @@ async def handle_message(message: Message) -> None:
             )
             answer = format_answer(fixed_answer, request_type=request_type)
             await log_event(user_id, "quality_autofix_applied", {"request_type": request_type})
-        elif request_type == "solve" and not is_solve_quality_ok(message.text, answer):
+        elif (request_type == "solve" or is_mapping_digits_task(message.text)) and not is_solve_quality_ok(message.text, answer):
             fix_prompt = build_solve_fix_prompt(message.text, answer)
             fixed_answer = await ask_nvidia(
                 user_id,
@@ -2180,7 +2188,7 @@ async def handle_photo(message: Message) -> None:
     else:
         # auto-confirm
         user_last_prompt[user_id] = text
-        request_type = classify_request_type(text)
+        request_type = normalize_request_type(text, classify_request_type(text))
         user_last_request_type[user_id] = request_type
         answer = await ask_nvidia(user_id, text, request_type=request_type)
         answer = format_answer(answer, request_type=request_type)
@@ -2221,7 +2229,7 @@ async def handle_document(message: Message) -> None:
             await message.answer("⚠️ Не смог прочитать текст из .txt. Попробуй другой файл.")
             return
         user_last_prompt[user_id] = text
-        request_type = classify_request_type(text)
+        request_type = normalize_request_type(text, classify_request_type(text))
         user_last_request_type[user_id] = request_type
         answer = await ask_nvidia(user_id, text, request_type=request_type)
         answer = format_answer(answer, request_type=request_type)
@@ -2241,7 +2249,7 @@ async def handle_document(message: Message) -> None:
 
         if text and len(text) >= 25:
             user_last_prompt[user_id] = text
-            request_type = classify_request_type(text)
+            request_type = normalize_request_type(text, classify_request_type(text))
             user_last_request_type[user_id] = request_type
             answer = await ask_nvidia(user_id, text, request_type=request_type)
             answer = format_answer(answer, request_type=request_type)
@@ -2285,7 +2293,7 @@ async def handle_document(message: Message) -> None:
             )
         else:
             user_last_prompt[user_id] = text
-            request_type = classify_request_type(text)
+            request_type = normalize_request_type(text, classify_request_type(text))
             user_last_request_type[user_id] = request_type
             answer = await ask_nvidia(user_id, text, request_type=request_type)
             answer = format_answer(answer, request_type=request_type)
