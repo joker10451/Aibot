@@ -799,6 +799,15 @@ async def ask_nvidia(user_id: int, user_text: str, append_user_message: bool = T
             break
         except Exception as e:
             last_error = e
+            # Частый кейс: конкретная модель недоступна на endpoint (404).
+            # Фолбэк на стабильную модель, чтобы не ронять ответ пользователю.
+            if "404" in str(e) and model != "z-ai/glm4_7":
+                model = "z-ai/glm4_7"
+                try:
+                    await update_user(user_id, {"model": model, "model_auto": True})
+                except Exception:
+                    pass
+                continue
             if attempt == 0:
                 await asyncio.sleep(1.2)
             else:
