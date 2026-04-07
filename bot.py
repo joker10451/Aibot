@@ -773,6 +773,16 @@ def build_solve_fix_prompt(original_prompt: str, draft_answer: str) -> str:
     )
 
 
+def extract_digits_answer(answer: str) -> Optional[str]:
+    m = re.search(r"(?:ответ|итог)\s*[:\-]?\s*(\d{3,8})\b", (answer or "").lower())
+    if m:
+        return m.group(1)
+    m2 = re.search(r"\b(\d{3,8})\b", answer or "")
+    if m2:
+        return m2.group(1)
+    return None
+
+
 def remaining_from(user_data: dict) -> int:
     tier = user_data.get("tier", "free")
     limit = TIERS[tier]["limit"]
@@ -2011,6 +2021,30 @@ async def handle_message(message: Message) -> None:
             )
             answer = format_answer(fixed_answer, request_type=request_type)
             await log_event(user_id, "quality_autofix_applied", {"request_type": "solve"})
+
+            # Жёсткий фолбэк для задач "соответствие -> последовательность цифр":
+            # не отправляем текстовый "поворот" вместо цифрового кода.
+            if not is_solve_quality_ok(message.text, answer):
+                strict_prompt = (
+                    "Верни только финальный ответ в формате:\n"
+                    "✅ Ответ: <последовательность цифр>\n"
+                    "Без объяснений, без слов, только одна строка."
+                )
+                strict_answer = await ask_nvidia(
+                    user_id,
+                    f"{message.text}\n\n{strict_prompt}",
+                    append_user_message=False,
+                    request_type=request_type,
+                )
+                strict_answer = format_answer(strict_answer, request_type=request_type)
+                digits = extract_digits_answer(strict_answer)
+                if digits:
+                    answer = f"✅ Ответ: {digits}"
+                else:
+                    answer = (
+                        "⚠️ Не смог надёжно собрать ответ в формате последовательности цифр.\n"
+                        "Пришли текст условия целиком (или более чёткое фото), и я верну только код цифр."
+                    )
 
         # Сохраняем последнюю связку вопрос→ответ для фидбека
         import time
